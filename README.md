@@ -29,6 +29,8 @@ nanoDAQ-LT(S)는 RS232 없이 **이더넷(TCP/UDP)과 CAN만 지원**하며, 로
 
 ## 사용법
 
+### CLI 연결 테스트
+
 ```bash
 python test_connection.py --ip 192.168.1.190 --channels 16 --duration 5
 ```
@@ -41,12 +43,42 @@ python test_connection.py --ip 192.168.1.190 --channels 16 --duration 5
 4. 들어오는 패킷을 헤더(`00 FF 00`)로 식별해 채널값 디코딩, 지정한 개수/시간만큼 출력
 5. Stream OFF 명령 전송 후 연결 종료
 
+### 실시간 모니터링 GUI
+
+```bash
+python monitor_gui.py
+```
+
+또는 `run_monitor.bat`을 더블클릭 (콘솔창 없이 바로 GUI만 뜸).
+
+IP/Port 입력 후 **Connect**를 누르면 자동으로:
+1. 접속 → 잔여 스트림 데이터 flush → Standby
+2. `Get Status(Full)`로 채널 수 / Full Scale / 압력 타입 자동 인식
+3. Protocol(16bit LE) + Rate(100Hz) 설정 → Stream On
+4. 압력값 실시간 표시, 온도는 5초 간격으로 raw 카운트 표시(섭씨 변환 아님 - 이유는 아래 참고)
+
+상단 `Stream On/Off`, `Rezero` 버튼으로 수동 제어도 가능합니다.
+
 ## 파일 구성
 
 | 파일 | 설명 |
 |---|---|
 | `nanodaq_client.py` | 명령 프레임 생성(패리티 포함), 패킷 파싱, `NanoDAQClient` 클래스 |
 | `test_connection.py` | CLI 연결 테스트 스크립트 |
+| `monitor_gui.py` | 실시간 채널 압력/온도 모니터링 GUI (tkinter) |
+| `run_monitor.bat` | `monitor_gui.py`를 콘솔창 없이 더블클릭 실행하는 launcher |
+
+## 알려진 이슈 / 트러블슈팅
+
+실제 nanoDAQ-LTS-16 유닛(펌웨어 2.2.2)으로 검증하는 과정에서, 매뉴얼과 다르게 동작하는
+부분들을 발견했습니다. 자세한 내용은 이 레포의 **Wiki**를 참고하세요:
+
+- Rate 명령의 채널 선택 값이 매뉴얼(4=TCP/UDP, 8=CAN)과 실제 장비(1=TCP/UDP, 2=CAN)가 다름
+- Get Status는 다른 명령과 달리 별도의 `**` ack 없이 바로 상태 프레임으로 응답함
+- Data Rate가 "Off"로 설정된 상태에서는 Stream On을 보내도 데이터가 전혀 나가지 않음
+- 저속(1~5Hz)에서는 TCP 버퍼링으로 인해 데이터가 몇 초 단위로 뭉쳐서 도착함 (정상 동작)
+- 이 유닛은 `Get Status`의 보정된 온도(With temp./Full)가 항상 `0.00`을 반환함 — 원인 불명의
+  펌웨어 결함으로 보이며, 대신 raw 값(level 4)을 그대로 사용
 
 ## 참고
 
