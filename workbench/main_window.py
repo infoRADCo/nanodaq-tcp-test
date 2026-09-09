@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QDialog,
 
 from . import profiles, theme
 from .ring import RingBuffer
-from .sim import RATE_HZ, SimSource
+from .sim import SimSource
 from .views.heatmap_view import HeatmapView
 from .views.polar_view import PolarView
 from .views.wake_view import WakeView
@@ -29,6 +29,7 @@ from .widgets import Pill
 
 ROOT = Path(__file__).resolve().parent.parent
 RING_CAPACITY = 16000  # 50 Hz × ~5.3분
+RATE_HZ_SIM = 50.0
 DRIFT_LIMIT_PA = 5.0
 
 
@@ -41,20 +42,28 @@ def _panel(layout=None) -> QFrame:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, source=None):
+        """source: 링 버퍼에 프레임을 쓰는 스레드 (SimSource 또는 NanoDAQSource).
+        None 이면 시뮬레이터. 두 소스는 같은 인터페이스를 노출한다."""
         super().__init__()
         self.setWindowTitle("전시 계측 워크벤치 PoC")
         self.resize(1280, 800)
 
-        self.ring = RingBuffer(RING_CAPACITY, 16)
-        self.sim = SimSource(self.ring)
+        if source is None:
+            self.ring = RingBuffer(RING_CAPACITY, 16)
+            self.sim = SimSource(self.ring)
+        else:
+            self.ring = source.ring
+            self.sim = source
+        self.is_hw = not isinstance(self.sim, SimSource)
+        self.rate_hz = float(getattr(self.sim, "rate_hz", RATE_HZ_SIM))
         self.sim.start()
 
         self.mode = "downwash"
         self.zero_time = None
         self.markers = []            # 이벤트 마커 (epoch 초)
         self.session_start = time.time()
-        self.session_name = f"sim_{datetime.now():%Y%m%d_%H%M}"
+        self.session_name = f"{'nanodaq' if self.is_hw else 'sim'}_{datetime.now():%Y%m%d_%H%M}"
 
         self._replay_t = np.empty(0)
         self._replay_v = np.empty((0, 16))
@@ -95,10 +104,14 @@ class MainWindow(QMainWindow):
     def _build_header(self):
         logo = QLabel("EXPO WORKBENCH")
         logo.setProperty("role", "logo")
-        ident = QLabel("nanoDAQ-LTS-16 · SIMULATOR · 16ch ±2.5 kPa")
-        ident.setProperty("role", "ident")
+        self.ident = QLabel("nanoDAQ-LTS-16 · SIMULATOR · 16ch ±2.5 kPa")
+        self.ident.setProperty("role", "ident")
+        ident = self.ident
 
         self.pill_sim = Pill("● SIMULATOR", "amber")
+        if self.is_hw:
+            self.ident.setText(f"nanoDAQ {self.sim.ip}:{self.sim.port} · 접속 중")
+            self.pill_sim.setText("● 접속 중")
         self.pill_zero = Pill("ZERO 필요", "amber")
 
         btn_report = QPushButton("\U0001F4C4 성적서")
@@ -125,7 +138,7 @@ class MainWindow(QMainWindow):
         hint.setProperty("role", "dim")
         self.toast = QLabel("")
         self.toast.setStyleSheet(f"color: {theme.AMBER};")
-        sess = QLabel(f"{self.session_name} · {RATE_HZ:.0f} Hz")
+        sess = QLabel(f"{self.session_name} · {self.rate_hz:.0f} Hz")
         sess.setProperty("role", "ident")
 
         lay = QHBoxLayout()
@@ -367,7 +380,8 @@ class MainWindow(QMainWindow):
         self.zero_time = datetime.now()
         self.pill_zero.setText(f"ZERO {self.zero_time:%H:%M}")
         self.pill_zero.set_kind("green")
-        self._show_toast("영점 조정 완료 (16ch)")
+        self._show_toast("장비 Rezero 명령 전송 (16ch)" if self.is_hw
+                         else "영점 조정 완료 (16ch)")
 
     def add_marker(self):
         t = time.time()
@@ -468,7 +482,7 @@ class MainWindow(QMainWindow):
             view.update_frame(vs[0], ts[0])
 
     def _update_recorder(self):
-        n = int(60 * RATE_HZ)
+        n = int(60 * self.rate_hz)
         ts, vs = self.ring.latest(n)
         if len(ts) < 5:
             return
@@ -513,7 +527,7 @@ class MainWindow(QMainWindow):
         if n == 0:
             self.play_timer.stop()
             return
-        self._replay_cursor += 4  # 80 ms × 50 Hz = 4 샘플 → 1× 재생
+        self._replay_cursor += max(1, round(0.08 * self.rate_hz))  # 80 ms 분량 → 1× 재생
         if self._replay_cursor >= n:
             if self.btn_loop.isChecked():
                 self._replay_cursor = 0
@@ -531,6 +545,8 @@ class MainWindow(QMainWindow):
         if self._tick_n % 12 == 0:  # ~1 s
             el = int(time.time() - self.session_start)
             self.pill_rec.setText(f"● REC {el // 60:02d}:{el % 60:02d}")
+            if self.is_hw:
+                self._update_device_pill()
         idx = self.tabs.currentIndex()
         if idx == 0:
             if self._tick_n % 3 == 0:  # ~5 Hz
@@ -539,6 +555,25 @@ class MainWindow(QMainWindow):
             self._update_live()
             if self._tick_n % 2 == 0:
                 self._update_recorder()
+
+    # ---------------- 장비 상태
+    def _update_device_pill(self):
+        st = self.sim.status()
+        state = st["state"]
+        if state == "streaming":
+            self.pill_sim.setText(f"● nanoDAQ {st['packets']} pkt")
+            self.pill_sim.set_kind("green")
+            self.ident.setText(st["message"])
+        elif state == "stale":
+            self.pill_sim.setText("● 데이터 없음")
+            self.pill_sim.set_kind("amber")
+        elif state == "connecting":
+            self.pill_sim.setText("● 접속 중")
+            self.pill_sim.set_kind("amber")
+        else:
+            self.pill_sim.setText("● 연결 오류")
+            self.pill_sim.set_kind("red")
+            self.ident.setText(st["message"])
 
     # ---------------- 성적서
     def _open_export_dialog(self):
@@ -554,7 +589,7 @@ class ExportDialog(QDialog):
         self.setMinimumWidth(420)
 
         p = profiles.PROFILES[win.mode]
-        ts, vs = win.ring.latest(int(2 * RATE_HZ))
+        ts, vs = win.ring.latest(int(2 * win.rate_hz))
         spare = np.array([c["spare"] for c in p["channels"]])
         if len(vs):
             act = vs[:, ~spare]
