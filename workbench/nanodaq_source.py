@@ -68,6 +68,7 @@ class NanoDAQSource(threading.Thread):
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._rezero_req = threading.Event()
+        self._rate_req = None          # 대기 중인 레이트 (Hz) — _lock 으로 보호
 
         # UI 가 읽는 상태 (스레드 안전 getter 로만 접근)
         self._state = "connecting"     # connecting | streaming | error
@@ -92,6 +93,31 @@ class NanoDAQSource(threading.Thread):
 
     def get_rpm(self) -> int:
         return 0
+
+    def set_alpha(self, deg: int):
+        pass
+
+    def get_alpha(self) -> int:
+        return 0
+
+    # ------------------------------------------------ 데이터 레이트
+    @staticmethod
+    def available_rates():
+        """장비가 받는 레이트 (Hz), 빠른 순."""
+        return sorted(RATE_TABLE, reverse=True)
+
+    def set_rate_hz(self, hz: int) -> bool:
+        """레이트 변경을 요청한다. 실제 적용은 스트림 스레드가 한다.
+
+        소켓은 스트림 스레드만 만지므로(다른 스레드에서 명령을 끼워 넣으면
+        스트림 바이트와 ack 가 섞인다) rezero 와 같은 방식으로 요청만 남긴다.
+        받아들일 수 있는 값이면 True.
+        """
+        if hz not in RATE_TABLE:
+            return False
+        with self._lock:
+            self._rate_req = hz
+        return True
 
     def get_offsets(self) -> np.ndarray:
         """영점 잔류 = 최근 1 s 평균. 실장비는 오프셋을 알 수 없으므로
@@ -180,9 +206,10 @@ class NanoDAQSource(threading.Thread):
             client.set_rate(self._rate_code, Channel.TCP_UDP)
             client.stream_on(Channel.TCP_UDP)
 
-            self._set("streaming",
-                      f"{fields.get('Model', 'nanoDAQ')} · FS {full_scale:g} {units}"
-                      f" = {self._full_scale_pa:.0f} Pa · {self.rate_hz:.0f} Hz{unit_note}")
+            self._msg_head = (f"{fields.get('Model', 'nanoDAQ')} · FS {full_scale:g} {units}"
+                              f" = {self._full_scale_pa:.0f} Pa")
+            self._msg_tail = unit_note
+            self._publish_streaming_msg()
             with self._lock:
                 self._last_packet_t = time.time()
 
@@ -195,10 +222,35 @@ class NanoDAQSource(threading.Thread):
                 pass
             client.close()
 
+    def _publish_streaming_msg(self):
+        self._set("streaming",
+                  f"{self._msg_head} · {self.rate_hz:.0f} Hz{self._msg_tail}")
+
     def _stream_loop(self, client, channels, full_scale, to_pa):
         buf = PacketBuffer(channels)
         vals = np.zeros(16)
         while not self._stop_evt.is_set():
+            with self._lock:
+                new_hz, self._rate_req = self._rate_req, None
+            if new_hz is not None and new_hz != self.rate_hz:
+                # rezero 와 같은 이유로 스트림을 멈추고 명령을 보낸다.
+                client.set_timeout(COMMAND_TIMEOUT)
+                client.stream_off(Channel.TCP_UDP)
+                client.flush_input()
+                ok = client.set_rate(RATE_TABLE[new_hz], Channel.TCP_UDP)
+                client.stream_on(Channel.TCP_UDP)
+                buf = PacketBuffer(channels)
+                if ok is False:
+                    # 장비가 거부 — 오버샘플링 설정이 상한을 낮춰둔 경우가 대표적.
+                    # 이전 레이트가 그대로 살아 있으므로 상태로만 알린다.
+                    self._set("streaming",
+                              f"{self._msg_head} · {self.rate_hz:.0f} Hz{self._msg_tail}"
+                              f" · {new_hz} Hz 거부됨 (오버샘플링 상한 확인)")
+                else:
+                    self.rate_hz = float(new_hz)
+                    self._rate_code = RATE_TABLE[new_hz]
+                    self._publish_streaming_msg()
+
             if self._rezero_req.is_set():
                 self._rezero_req.clear()
                 # 스트림 바이트와 ack 가 섞이지 않도록 잠시 멈추고 rezero

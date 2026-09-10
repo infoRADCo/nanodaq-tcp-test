@@ -27,6 +27,7 @@ class SimSource(threading.Thread):
         self._drone = False
         self._shield = False
         self._rpm = 4000
+        self._alpha = 4
 
         # 품질 게이트 스토리용 초기 영점 오프셋: CH3 +12 Pa, CH7 −9 Pa (1-based)
         off = np.zeros(16)
@@ -56,6 +57,14 @@ class SimSource(threading.Thread):
         with self._lock:
             return self._rpm
 
+    def set_alpha(self, deg: int):
+        with self._lock:
+            self._alpha = int(deg)
+
+    def get_alpha(self) -> int:
+        with self._lock:
+            return self._alpha
+
     def get_offsets(self) -> np.ndarray:
         with self._lock:
             return self._offsets.copy()
@@ -77,12 +86,15 @@ class SimSource(threading.Thread):
                 drone = self._drone
                 shield = self._shield
                 rpm = self._rpm
+                alpha = self._alpha
                 off = self._offsets
             ts = time.time() - self._t0
             if mode == "downwash":
                 vals = self._gen_downwash(ts, drone)
             elif mode == "edf":
                 vals = self._gen_edf(ts, shield)
+            elif mode == "airfoil":
+                vals = self._gen_airfoil(ts, alpha)
             else:
                 vals = self._gen_aerobench(ts, rpm)
             self.ring.append(time.time(), vals + off)
@@ -123,6 +135,22 @@ class SimSource(threading.Thread):
                               + profiles.EDF["positions"][:, 1] ** 2
                               > (0.7 ** 2), 1.0, 0.85)
             vals += -240.0 * (fall ** 1.5) * ring_w
+        return vals
+
+    def _gen_airfoil(self, ts, alpha):
+        """받음각 alpha 에서의 표면탭 압력 (Pa).
+
+        받음각을 올리면 정체점이 탭 열을 따라 뒤로 밀린다 — 실장비 스윕에서
+        최대 양압이 CH1 → CH3 · CH5 로 옮겨간 거동 그대로다.
+        """
+        q = 695.0                     # 실측 스윕의 최대 정체압과 같은 크기
+        s_stag = float(np.clip(0.04 + 0.055 * alpha, 0.0, 0.78))
+        s_tap = np.linspace(0.0, 1.0, len(profiles.AIRFOIL_TAPS))
+        breath = 1.0 + 0.02 * np.sin(2 * np.pi * 0.35 * ts)
+        cp = profiles.airfoil_cp(s_tap, s_stag)
+        vals = np.zeros(16)
+        vals[profiles.AIRFOIL_TAPS] = q * cp * breath
+        vals += self._rng.normal(0.0, 1.2, 16)
         return vals
 
     def _gen_aerobench(self, ts, rpm):

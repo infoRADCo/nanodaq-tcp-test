@@ -12,7 +12,8 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QComboBox,
+                               QDialog,
                                QFrame, QHBoxLayout, QHeaderView, QLabel,
                                QListWidget, QMainWindow, QMessageBox,
                                QPushButton, QSlider, QStackedWidget,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QDialog,
 from . import profiles, theme
 from .ring import RingBuffer
 from .sim import SimSource
+from .views.cp_view import CpView
 from .views.heatmap_view import HeatmapView
 from .views.polar_view import PolarView
 from .views.wake_view import WakeView
@@ -114,6 +116,25 @@ class MainWindow(QMainWindow):
             self.pill_sim.setText("● 접속 중")
         self.pill_zero = Pill("ZERO 필요", "amber")
 
+        rate_label = QLabel("레이트")
+        rate_label.setProperty("role", "dim")
+        self.rate_box = QComboBox()
+        rates = (self.sim.available_rates() if hasattr(self.sim, "available_rates")
+                 else [int(self.rate_hz)])
+        for hz in rates:
+            self.rate_box.addItem(f"{hz} Hz", hz)
+        i = self.rate_box.findData(int(self.rate_hz))
+        if i >= 0:
+            self.rate_box.setCurrentIndex(i)
+        if self.is_hw:
+            self.rate_box.setToolTip(
+                "장비 데이터 레이트. 오버샘플링 설정이 상한을 낮춰둔 경우\n"
+                "높은 값은 장비가 거부할 수 있습니다 (거부 시 이전 값 유지).")
+            self.rate_box.currentIndexChanged.connect(self._on_rate_changed)
+        else:
+            self.rate_box.setEnabled(False)
+            self.rate_box.setToolTip("시뮬레이터는 50 Hz 고정 — 실장비 모드에서만 변경됩니다.")
+
         btn_report = QPushButton("\U0001F4C4 성적서")
         btn_report.clicked.connect(self._open_export_dialog)
 
@@ -125,6 +146,9 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
         lay.addWidget(self.pill_sim)
         lay.addWidget(self.pill_zero)
+        lay.addSpacing(10)
+        lay.addWidget(rate_label)
+        lay.addWidget(self.rate_box)
         lay.addSpacing(10)
         lay.addWidget(btn_report)
         return _panel(lay)
@@ -138,8 +162,9 @@ class MainWindow(QMainWindow):
         hint.setProperty("role", "dim")
         self.toast = QLabel("")
         self.toast.setStyleSheet(f"color: {theme.AMBER};")
-        sess = QLabel(f"{self.session_name} · {self.rate_hz:.0f} Hz")
-        sess.setProperty("role", "ident")
+        self.sess_label = QLabel(f"{self.session_name} · {self.rate_hz:.0f} Hz")
+        self.sess_label.setProperty("role", "ident")
+        sess = self.sess_label
 
         lay = QHBoxLayout()
         lay.setContentsMargins(12, 6, 12, 6)
@@ -274,6 +299,7 @@ class MainWindow(QMainWindow):
             "downwash": HeatmapView(self.sim),
             "edf": PolarView(self.sim),
             "aerobench": WakeView(self.sim),
+            "airfoil": CpView(self.sim),
         }
         self.live_stack = QStackedWidget()
         for key in profiles.MODE_ORDER:
@@ -309,6 +335,7 @@ class MainWindow(QMainWindow):
             "downwash": HeatmapView(self.sim),
             "edf": PolarView(self.sim),
             "aerobench": WakeView(self.sim),
+            "airfoil": CpView(self.sim),
         }
         self.replay_stack = QStackedWidget()
         for key in profiles.MODE_ORDER:
@@ -417,6 +444,19 @@ class MainWindow(QMainWindow):
     def closeEvent(self, ev):
         self.shutdown()
         super().closeEvent(ev)
+
+    def _on_rate_changed(self, _index: int):
+        hz = self.rate_box.currentData()
+        if hz is None or not self.is_hw:
+            return
+        if not self.sim.set_rate_hz(int(hz)):
+            self._show_toast(f"{hz} Hz 는 지원되지 않는 값입니다")
+            return
+        # rate_hz 는 리플레이/버퍼 길이 계산에도 쓰이므로 같이 옮긴다.
+        # 장비가 거부하면 소스가 이전 레이트를 유지하고 상태줄에 남긴다.
+        self.rate_hz = float(hz)
+        self.sess_label.setText(f"{self.session_name} · {self.rate_hz:.0f} Hz")
+        self._show_toast(f"데이터 레이트 {hz} Hz 로 변경 요청")
 
     # ================================================= 내부
     def _show_toast(self, msg: str):
