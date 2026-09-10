@@ -31,6 +31,9 @@ are shown instead in that case.
 
 from __future__ import annotations
 
+import csv
+import datetime
+import os
 import queue
 import socket
 import threading
@@ -49,7 +52,13 @@ from nanodaq_client import (
     scale_differential,
 )
 
-TEMP_POLL_INTERVAL = 5.0  # seconds between temperature polls
+TEMP_POLL_INTERVAL = 60.0  # seconds between temperature polls
+# Each poll costs ~2.5s of dead time (stream off -> drain the reply until the
+# device goes quiet for COMMAND_TIMEOUT -> stream on), during which NO pressure
+# data arrives. At the old 5s interval that was 52%% of the session lost, which
+# a logged run measured directly. Temperature is display-only here (and this
+# unit only returns uncalibrated raw counts anyway), so it is not worth paying
+# for often - at 60s the loss is ~4%%.
 # NOTE: at low pressure Rate settings (e.g. 1-5Hz), the device batches TCP
 # packets and only flushes them every ~4s (Nagle/delayed-ACK style
 # buffering - confirmed on real hardware, not a bug in this client). If
@@ -60,6 +69,41 @@ TEMP_POLL_INTERVAL = 5.0  # seconds between temperature polls
 # interval well above the flush period, especially if you lower the Rate.
 STREAM_READ_TIMEOUT = 0.2  # socket timeout while polling for pressure packets
 COMMAND_TIMEOUT = 2.0  # socket timeout while doing setup / temp-poll command round trips
+
+PSI_TO_PA = 6894.757293168361  # exact by definition (1 psi = 6894.757293168361 Pa)
+
+# ISA sea-level air density, used for the pitot airspeed column. This is a
+# fixed constant, NOT compensated for the actual ambient temperature or
+# barometric pressure - at 20 C / 1013 hPa the true density is ~1.204, so
+# the displayed speed reads ~0.9% low there. Adjust if you need better than
+# ~1% airspeed accuracy.
+AIR_DENSITY = 1.225  # kg/m^3
+
+# Displayed decimals. One 16-bit LSB at FS=1 psi is 2/65535 = 3.05e-5 psi
+# (0.21 Pa), so 5 decimals in psi / 2 in Pa is the last digit that still
+# carries device resolution - anything beyond that is pure quantisation.
+PSI_DECIMALS = 5
+PA_DECIMALS = 2
+
+LOG_DIR = "logs"
+# The stream runs at 100 Hz; logging every packet is ~100 rows/s (~100 MB/h).
+# Log every Nth packet instead - at N=10 that is ~10 Hz, still far faster
+# than anything mechanical being measured here, so nothing real is lost.
+# Set to 1 if you genuinely need every sample.
+LOG_DECIMATION = 10
+
+
+def airspeed_kmh(q_pa: float) -> float:
+    """Incompressible pitot relation: v = sqrt(2q/rho), returned in km/h.
+
+    The sign of the differential pressure is carried through (a negative q
+    means the reference port is at the higher pressure, i.e. reversed flow),
+    so the magnitude uses abs(q) and the sign is re-applied afterwards.
+    Valid well below Mach 0.3; at +/-1 psi FS the top of range is ~34 m/s,
+    so compressibility is never a concern on this unit.
+    """
+    speed = (2.0 * abs(q_pa) / AIR_DENSITY) ** 0.5
+    return (speed if q_pa >= 0 else -speed) * 3.6
 
 
 class Worker(threading.Thread):
@@ -114,7 +158,13 @@ class Worker(threading.Thread):
             full_scale = float(status.fields.get("Full scale", "1"))
         except ValueError:
             full_scale = 1.0
-        units = status.fields.get("Press. units", "")
+        # This unit's firmware (2.2.2) truncates the 'full' status before the
+        # [Press. units] / [Press. type] fields the manual documents, so the
+        # get() below comes back empty on real hardware. Fall back to psi:
+        # confirmed against the datasheet (+/-1 psi FS) and by polling a live
+        # packet - raw sat at mid-scale (~32900) with all ports at ambient,
+        # which only matches the differential +/-FS scaling, not absolute.
+        units = status.fields.get("Press. units", "") or "psi"
         press_type = status.fields.get("Press. type", "Differential")
 
         self.out.put((
@@ -198,7 +248,11 @@ class Worker(threading.Thread):
                     packet = buf.pop_packet()
                     while packet is not None:
                         values = [scale_differential(v, full_scale) for v in packet.values]
-                        self.out.put(("pressure", values))
+                        # Raw counts ride along so the log stays lossless -
+                        # scaling is reversible, but keeping the integers
+                        # means a log can be re-scaled later if the full
+                        # scale or pressure type turns out to be different.
+                        self.out.put(("pressure", (values, packet.values)))
                         packet = buf.pop_packet()
                 else:
                     time.sleep(0.1)
@@ -221,6 +275,13 @@ class MonitorApp:
         self.out_queue: "queue.Queue[tuple]" = queue.Queue()
         self.channel_rows: list[dict[str, tk.Widget]] = []
         self.units = ""
+        self.channel_count = 0
+        self.log_fh = None
+        self.log_writer = None
+        self.log_path: str | None = None
+        self.log_packet_index = 0
+        self.log_rows_written = 0
+        self.log_started_at = 0.0
 
         top = ttk.Frame(root, padding=8)
         top.pack(fill="x")
@@ -245,8 +306,11 @@ class MonitorApp:
         self.rezero_btn = ttk.Button(top, text="Rezero", command=self.on_rezero, state="disabled")
         self.rezero_btn.grid(row=0, column=6, padx=4)
 
+        self.log_btn = ttk.Button(top, text="Log Start", command=self.on_log_toggle, state="disabled")
+        self.log_btn.grid(row=0, column=7, padx=4)
+
         self.status_var = tk.StringVar(value="Disconnected")
-        ttk.Label(top, textvariable=self.status_var).grid(row=0, column=7, padx=12)
+        ttk.Label(top, textvariable=self.status_var).grid(row=0, column=8, padx=12)
 
         self.grid_frame = ttk.Frame(root, padding=8)
         self.grid_frame.pack(fill="both", expand=True)
@@ -290,7 +354,91 @@ class MonitorApp:
         if self.worker is not None:
             self.worker.request_rezero()
 
+    def on_log_toggle(self) -> None:
+        if self.log_writer is None:
+            self.start_logging()
+        else:
+            self.stop_logging()
+
+    def start_logging(self) -> None:
+        if self.channel_count <= 0:
+            self.log_var.set("Connect first - channel count is not known yet")
+            return
+        os.makedirs(LOG_DIR, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(LOG_DIR, "nanodaq_" + stamp + ".csv")
+        try:
+            # newline="" is required by the csv module on Windows, otherwise
+            # every row gets a stray blank line between it and the next.
+            fh = open(path, "w", newline="", encoding="utf-8")
+        except OSError as exc:
+            self.log_var.set(f"Could not open log file: {exc}")
+            return
+
+        writer = csv.writer(fh)
+        # Metadata as a leading '#' comment line: pandas reads it back with
+        # comment="#", Excel just shows it as a first row.
+        writer.writerow([
+            f"# nanoDAQ log  start={datetime.datetime.now().isoformat(timespec='seconds')}"
+            f"  channels={self.channel_count}  units={self.units}"
+            f"  air_density={AIR_DENSITY}  decimation={LOG_DECIMATION}"
+        ])
+        header = ["iso_time", "elapsed_s", "packet_index"]
+        header += [f"ch{i}_raw" for i in range(1, self.channel_count + 1)]
+        header += [f"ch{i}_psig" for i in range(1, self.channel_count + 1)]
+        header += [f"ch{i}_pa" for i in range(1, self.channel_count + 1)]
+        header += [f"ch{i}_kmh" for i in range(1, self.channel_count + 1)]
+        writer.writerow(header)
+
+        self.log_fh = fh
+        self.log_writer = writer
+        self.log_path = path
+        self.log_packet_index = 0
+        self.log_rows_written = 0
+        self.log_started_at = time.time()
+        self.log_btn.configure(text="Log Stop")
+        self.log_var.set(f"Logging to {os.path.abspath(path)}")
+
+    def stop_logging(self) -> None:
+        if self.log_fh is not None:
+            try:
+                self.log_fh.close()
+            except OSError:
+                pass
+        path, rows = self.log_path, self.log_rows_written
+        self.log_fh = None
+        self.log_writer = None
+        self.log_path = None
+        self.log_btn.configure(text="Log Start")
+        if path is not None:
+            self.log_var.set(f"Log saved: {os.path.abspath(path)} ({rows} rows)")
+
+    def write_log_row(self, values: list[float], raws: list[int]) -> None:
+        self.log_packet_index += 1
+        if (self.log_packet_index - 1) % LOG_DECIMATION:
+            return
+        now = time.time()
+        row = [
+            datetime.datetime.now().isoformat(timespec="milliseconds"),
+            f"{now - self.log_started_at:.3f}",
+            self.log_packet_index,
+        ]
+        pascals = [v * PSI_TO_PA for v in values]
+        row += list(raws)
+        row += [f"{v:.{PSI_DECIMALS}f}" for v in values]
+        row += [f"{pa:.{PA_DECIMALS}f}" for pa in pascals]
+        row += [f"{airspeed_kmh(pa):.2f}" for pa in pascals]
+        try:
+            self.log_writer.writerow(row)
+            self.log_rows_written += 1
+            # Flush so an external reader (or a crash) never loses the tail.
+            self.log_fh.flush()
+        except (OSError, ValueError) as exc:
+            self.log_var.set(f"Log write failed, logging stopped: {exc}")
+            self.stop_logging()
+
     def on_close(self) -> None:
+        self.stop_logging()
         if self.worker is not None:
             self.worker.request_stop()
         self.root.after(200, self.root.destroy)
@@ -302,19 +450,37 @@ class MonitorApp:
             child.destroy()
         self.channel_rows = []
         self.units = units
+        self.channel_count = channels
 
+        # "psig" rather than "psid": the scanner only has Absolute/Differential
+        # modes (no gauge mode exists in the command set), and gauge readings
+        # are made by leaving the common reference port open to atmosphere -
+        # which is how this rig is plumbed. If you ever pipe the reference
+        # port to something other than ambient, this label is a lie.
+        gauge_label = f"{units}g" if units == "psi" else units
         ttk.Label(self.grid_frame, text="CH", width=4, font=("", 10, "bold")).grid(row=0, column=0)
-        ttk.Label(self.grid_frame, text=f"Pressure ({units})", width=16, font=("", 10, "bold")).grid(row=0, column=1)
-        ttk.Label(self.grid_frame, text="Temp (raw)", width=10, font=("", 10, "bold")).grid(row=0, column=2)
+        ttk.Label(self.grid_frame, text=f"Pressure ({gauge_label})", width=14, font=("", 10, "bold")).grid(row=0, column=1)
+        ttk.Label(self.grid_frame, text="Pressure (Pa)", width=14, font=("", 10, "bold")).grid(row=0, column=2)
+        ttk.Label(self.grid_frame, text="Airspeed (km/h)", width=14, font=("", 10, "bold")).grid(row=0, column=3)
+        ttk.Label(self.grid_frame, text="Temp (raw)", width=10, font=("", 10, "bold")).grid(row=0, column=4)
 
         for ch in range(channels):
             row = ch + 1
             ttk.Label(self.grid_frame, text=str(ch + 1), width=4).grid(row=row, column=0)
             pressure_var = tk.StringVar(value="--")
+            pascal_var = tk.StringVar(value="--")
+            speed_var = tk.StringVar(value="--")
             temp_var = tk.StringVar(value="--")
-            ttk.Label(self.grid_frame, textvariable=pressure_var, width=16).grid(row=row, column=1)
-            ttk.Label(self.grid_frame, textvariable=temp_var, width=10).grid(row=row, column=2)
-            self.channel_rows.append({"pressure": pressure_var, "temp": temp_var})
+            ttk.Label(self.grid_frame, textvariable=pressure_var, width=14).grid(row=row, column=1)
+            ttk.Label(self.grid_frame, textvariable=pascal_var, width=14).grid(row=row, column=2)
+            ttk.Label(self.grid_frame, textvariable=speed_var, width=14).grid(row=row, column=3)
+            ttk.Label(self.grid_frame, textvariable=temp_var, width=10).grid(row=row, column=4)
+            self.channel_rows.append({
+                "pressure": pressure_var,
+                "pascal": pascal_var,
+                "speed": speed_var,
+                "temp": temp_var,
+            })
 
     def poll_queue(self) -> None:
         try:
@@ -329,10 +495,17 @@ class MonitorApp:
                     self.connect_btn.configure(text="Disconnect", state="normal")
                     self.stream_btn.configure(state="normal", text="Stream Off")
                     self.rezero_btn.configure(state="normal")
+                    self.log_btn.configure(state="normal")
                     self.streaming = True
                 elif kind == "pressure":
-                    for var_row, value in zip(self.channel_rows, payload):
-                        var_row["pressure"].set(f"{value:.4f}")
+                    values, raws = payload
+                    if self.log_writer is not None:
+                        self.write_log_row(values, raws)
+                    for var_row, value in zip(self.channel_rows, values):
+                        pascal = value * PSI_TO_PA
+                        var_row["pressure"].set(f"{value:.{PSI_DECIMALS}f}")
+                        var_row["pascal"].set(f"{pascal:.{PA_DECIMALS}f}")
+                        var_row["speed"].set(f"{airspeed_kmh(pascal):.2f}")
                 elif kind == "temperature":
                     for var_row, value in zip(self.channel_rows, payload):
                         var_row["temp"].set(f"{value:.0f}")
@@ -341,9 +514,11 @@ class MonitorApp:
                 elif kind == "disconnected":
                     self.worker = None
                     self.status_var.set("Disconnected")
+                    self.stop_logging()
                     self.connect_btn.configure(text="Connect", state="normal")
                     self.stream_btn.configure(state="disabled")
                     self.rezero_btn.configure(state="disabled")
+                    self.log_btn.configure(state="disabled")
         except queue.Empty:
             pass
         self.root.after(100, self.poll_queue)
