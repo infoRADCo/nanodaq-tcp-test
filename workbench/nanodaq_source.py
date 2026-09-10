@@ -33,6 +33,19 @@ RATE_TABLE = {
     10: DataRate.HZ_10, 5: DataRate.HZ_5, 1: DataRate.HZ_1,
 }
 
+# nanoDAQ-LTS-16 (FW 2.2.2) 은 Get Status(Full) 응답을 [CAN message] 에서 끊어
+# 보내며, 매뉴얼(fig 3.2)에 있는 [Press. units]·[Press. type] 을 아예 싣지 않는다.
+# 실장비로 확인: 4 초를 기다려도 그 뒤가 오지 않는다.
+#
+# 이때 환산 계수를 1.0 으로 두면 psi 값이 Pa 라벨을 달고 표시되어 6,895 배
+# 작은 수가 조용히 나간다(620 Pa → 0.09). 그래서 '단위 미보고' 는 psi 로 가정한다:
+#   - 데이터시트의 레인지 표기가 psi 이고 [Full scale] 1.0 이 ±1 psi 와 일치
+#   - 실측 검증 — 전 포트 대기 개방 상태에서 raw 가 중앙값 32,768 부근에 앉는데,
+#     이는 차압 ±FS 스케일링에서만 나오는 값이다 (절대압 해석이면 ~56,575)
+# 값을 신뢰할 수 없는 경우는 '모르는 단위 문자열이 온 경우' 뿐이고, 그때만 환산을
+# 포기한다. 어느 쪽이든 가정한 사실은 상태줄에 남긴다.
+ASSUMED_UNITS = "psi"
+
 # Get Status 의 [Press. units] → Pa 환산 계수. 화면은 항상 Pa 로 표시한다.
 UNITS_TO_PA = {
     "pa": 1.0, "hpa": 100.0, "kpa": 1000.0, "mbar": 100.0, "bar": 1e5,
@@ -145,9 +158,17 @@ class NanoDAQSource(threading.Thread):
             full_scale = float(fields.get("Full scale", "1"))
             units = fields.get("Press. units", "").strip()
             to_pa = UNITS_TO_PA.get(units.lower().replace(" ", ""))
-            if to_pa is None:
-                # 미지 단위: 환산 없이 표시하고 상태에 남긴다
+            if to_pa is not None:
+                unit_note = ""
+            elif not units:
+                # 장비가 단위를 아예 안 보냄 (LTS-16 FW 2.2.2) — psi 로 가정한다.
+                units = ASSUMED_UNITS
+                to_pa = UNITS_TO_PA[ASSUMED_UNITS]
+                unit_note = f" · 단위 미보고 → {ASSUMED_UNITS} 가정"
+            else:
+                # 모르는 단위 문자열: 추측하지 않는다. 환산 없이 내보내되 크게 알린다.
                 to_pa = 1.0
+                unit_note = f" · 단위 '{units}' 미환산 — 표시값은 Pa 가 아님"
             with self._lock:
                 self._info = dict(fields)
                 self._full_scale_pa = full_scale * to_pa
@@ -159,7 +180,6 @@ class NanoDAQSource(threading.Thread):
             client.set_rate(self._rate_code, Channel.TCP_UDP)
             client.stream_on(Channel.TCP_UDP)
 
-            unit_note = "" if units.lower() in UNITS_TO_PA else f" · 단위 '{units}' 미환산"
             self._set("streaming",
                       f"{fields.get('Model', 'nanoDAQ')} · FS {full_scale:g} {units}"
                       f" = {self._full_scale_pa:.0f} Pa · {self.rate_hz:.0f} Hz{unit_note}")
