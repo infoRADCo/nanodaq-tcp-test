@@ -61,6 +61,7 @@ class MainWindow(QMainWindow):
 
         self.mode = "downwash"
         self.zero_time = None
+        self._zero_seen_t = 0.0  # 마지막으로 반영한 실장비 Zero 결과 시각
         self.markers = []            # 이벤트 마커 (epoch 초)
         self.session_start = time.time()
         self.session_name = f"{'nanodaq' if self.is_hw else 'sim'}_{datetime.now():%Y%m%d_%H%M}"
@@ -377,11 +378,19 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.Yes:
                 return
         self.sim.zero_all()
+        if self.is_hw:
+            # 실장비는 비동기 — 결과(done/failed)는 _update_zero_pill 이
+            # NanoDAQSource.status()["zero"] 를 보고 반영한다. 여기서 초록으로
+            # 바꾸면 장비가 거부했거나 끊겼을 때도 '영점 완료' 로 남는다.
+            self.pill_zero.setText("ZERO 요청 중…")
+            self.pill_zero.set_kind("amber")
+            self._show_toast("장비 Rezero 요청 (16ch)")
+            self._update_zero_pill(self.sim.status())
+            return
         self.zero_time = datetime.now()
         self.pill_zero.setText(f"ZERO {self.zero_time:%H:%M}")
         self.pill_zero.set_kind("green")
-        self._show_toast("장비 Rezero 명령 전송 (16ch)" if self.is_hw
-                         else "영점 조정 완료 (16ch)")
+        self._show_toast("영점 조정 완료 (16ch)")
 
     def add_marker(self):
         t = time.time()
@@ -557,8 +566,24 @@ class MainWindow(QMainWindow):
                 self._update_recorder()
 
     # ---------------- 장비 상태
+    def _update_zero_pill(self, st: dict):
+        """실장비 Zero All 결과를 알약에 반영한다. 같은 결과는 한 번만 처리."""
+        zero = st.get("zero")
+        if zero in (None, "pending") or st.get("zero_t", 0.0) == self._zero_seen_t:
+            return
+        self._zero_seen_t = st["zero_t"]
+        if zero == "done":
+            self.zero_time = datetime.fromtimestamp(st["zero_t"])
+            self.pill_zero.setText(f"ZERO {self.zero_time:%H:%M}")
+            self.pill_zero.set_kind("green")
+        else:
+            self.pill_zero.setText("ZERO 실패")
+            self.pill_zero.set_kind("red")
+        self._show_toast(st.get("zero_msg") or ("장비 Rezero 완료" if zero == "done" else "장비 Rezero 실패"))
+
     def _update_device_pill(self):
         st = self.sim.status()
+        self._update_zero_pill(st)
         state = st["state"]
         if state == "streaming":
             self.pill_sim.setText(f"● nanoDAQ {st['packets']} pkt")
