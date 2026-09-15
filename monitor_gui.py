@@ -26,7 +26,9 @@ Only Differential-type scanners are converted to engineering units here
 (raw = 0..65535 maps linearly to -full_scale..+full_scale). Absolute-mode
 scaling depends on model/full-scale specific lookup tables (see section
 4.1.3 of the User Programming Guide) and is not implemented - raw counts
-are shown instead in that case.
+are shown in the pressure column and the Pa / airspeed columns stay "--".
+The same "--" fallback applies when the device reports a pressure unit not
+listed in UNITS_TO_PA, rather than silently treating it as psi.
 """
 
 from __future__ import annotations
@@ -71,6 +73,20 @@ STREAM_READ_TIMEOUT = 0.2  # socket timeout while polling for pressure packets
 COMMAND_TIMEOUT = 2.0  # socket timeout while doing setup / temp-poll command round trips
 
 PSI_TO_PA = 6894.757293168361  # exact by definition (1 psi = 6894.757293168361 Pa)
+
+# Pa per one unit of the device's reported [Press. units]. Keys are lower
+# case with spaces removed. Anything not listed is displayed unconverted.
+UNITS_TO_PA = {
+    "pa": 1.0, "hpa": 100.0, "kpa": 1000.0, "mbar": 100.0, "bar": 1e5,
+    "psi": PSI_TO_PA, "psig": PSI_TO_PA, "psid": PSI_TO_PA,
+    "inh2o": 249.089, "mmh2o": 9.80665, "mmhg": 133.322, "torr": 133.322,
+}
+
+# Sanity bound on the channel count parsed out of Get Status. The nanoDAQ-LT
+# family tops out at 64 channels; a bigger number means the status text was
+# mis-parsed (or the peer is not a nanoDAQ), and building thousands of Tk
+# rows for it would freeze the GUI.
+MAX_CHANNELS = 64
 
 # ISA sea-level air density, used for the pitot airspeed column. This is a
 # fixed constant, NOT compensated for the actual ambient temperature or
@@ -125,6 +141,37 @@ class Worker(threading.Thread):
     def request_rezero(self) -> None:
         self.commands.put(("rezero",))
 
+    def _send(self, client: NanoDAQClient, label: str, fn, fail_msg: str = "rejected by device (!!)") -> bool:
+        """One command round trip with the outcome actually checked.
+
+        Returns True only on success. A negative ack (`!!`), a timeout or
+        malformed ack bytes are reported to the GUI and return False, so the
+        caller can keep its notion of the device state in sync instead of
+        assuming the command worked. Connection-level OSErrors are NOT
+        swallowed here - those mean the session is gone and are handled by
+        the main loop.
+        """
+        client.set_timeout(COMMAND_TIMEOUT)
+        try:
+            ok = fn()
+        except socket.timeout:
+            self.out.put(("error", f"{label}: no ack from device (timeout)"))
+            return False
+        except RuntimeError as exc:
+            self.out.put(("error", f"{label}: {exc}"))
+            return False
+        if ok is False:
+            self.out.put(("error", f"{label}: {fail_msg}"))
+            return False
+        return True
+
+    def _stop_stream(self, client: NanoDAQClient, label: str) -> bool:
+        """Stream Off for a stream that is currently running. The ack is
+        buried in the in-flight packets, so success = the line going quiet
+        (see NanoDAQClient.stream_off_quiesce)."""
+        return self._send(client, label, lambda: client.stream_off_quiesce(Channel.TCP_UDP),
+                          fail_msg="device kept streaming after Stream Off")
+
     def run(self) -> None:
         client = NanoDAQClient(self.ip, self.port, timeout=COMMAND_TIMEOUT)
         try:
@@ -154,6 +201,9 @@ class Worker(threading.Thread):
             channels = int(channels_raw)
         except ValueError:
             channels = 16
+        if not 1 <= channels <= MAX_CHANNELS:
+            self.out.put(("error", f"device reported {channels} channels (expected 1..{MAX_CHANNELS}) - assuming 16"))
+            channels = 16
         try:
             full_scale = float(status.fields.get("Full scale", "1"))
         except ValueError:
@@ -164,12 +214,27 @@ class Worker(threading.Thread):
         # confirmed against the datasheet (+/-1 psi FS) and by polling a live
         # packet - raw sat at mid-scale (~32900) with all ports at ambient,
         # which only matches the differential +/-FS scaling, not absolute.
-        units = status.fields.get("Press. units", "") or "psi"
-        press_type = status.fields.get("Press. type", "Differential")
+        units = status.fields.get("Press. units", "").strip() or "psi"
+        press_type = status.fields.get("Press. type", "Differential").strip() or "Differential"
+
+        # Only Differential counts have a known linear scaling (see module
+        # docstring). Absolute-mode devices get raw counts in the pressure
+        # column; unknown units are shown in the device's own unit but not
+        # converted to Pa. Both cases leave to_pa = None so the GUI and the
+        # CSV writer print "--" for Pa / airspeed instead of a wrong number.
+        scaled = press_type.lower().startswith("diff")
+        to_pa = UNITS_TO_PA.get(units.lower().replace(" ", "")) if scaled else None
+        if not scaled:
+            self.out.put(("error", f"pressure type '{press_type}': showing raw counts, no Pa/airspeed"))
+        elif to_pa is None:
+            self.out.put(("error", f"unknown pressure unit '{units}': values shown in {units}, no Pa/airspeed"))
 
         self.out.put((
             "config",
-            {"channels": channels, "full_scale": full_scale, "units": units, "press_type": press_type},
+            {
+                "channels": channels, "full_scale": full_scale, "units": units,
+                "press_type": press_type, "scaled": scaled, "to_pa": to_pa,
+            },
         ))
 
         try:
@@ -189,7 +254,10 @@ class Worker(threading.Thread):
 
         try:
             while not stopping:
-                # 1) drain any pending GUI requests
+                # 1) drain any pending GUI requests. Every command's outcome
+                #    is checked (see _send) and the resulting stream state is
+                #    echoed back so the GUI never shows a state the device
+                #    refused.
                 try:
                     while True:
                         cmd = self.commands.get_nowait()
@@ -197,16 +265,30 @@ class Worker(threading.Thread):
                             stopping = True
                             break
                         elif cmd[0] == "stream_on" and not streaming:
-                            client.set_timeout(COMMAND_TIMEOUT)
-                            client.stream_on(Channel.TCP_UDP)
-                            streaming = True
+                            if self._send(client, "Stream On", lambda: client.stream_on(Channel.TCP_UDP)):
+                                streaming = True
+                                buf = PacketBuffer(channels)
+                            self.out.put(("stream_state", streaming))
                         elif cmd[0] == "stream_off" and streaming:
-                            client.set_timeout(COMMAND_TIMEOUT)
-                            client.stream_off(Channel.TCP_UDP)
-                            streaming = False
+                            if self._stop_stream(client, "Stream Off"):
+                                streaming = False
+                            self.out.put(("stream_state", streaming))
                         elif cmd[0] == "rezero":
-                            client.set_timeout(COMMAND_TIMEOUT)
-                            client.rezero()
+                            # Rezero's ack would be lost in the stream just
+                            # like Stream Off's, so pause the stream around it
+                            # (same sequence the workbench uses).
+                            if streaming:
+                                if not self._stop_stream(client, "Stream Off (rezero)"):
+                                    continue
+                                if self._send(client, "Rezero", client.rezero):
+                                    self.out.put(("info", "Rezero acknowledged by device"))
+                                if self._send(client, "Stream On (after rezero)", lambda: client.stream_on(Channel.TCP_UDP)):
+                                    buf = PacketBuffer(channels)
+                                else:
+                                    streaming = False
+                                    self.out.put(("stream_state", False))
+                            elif self._send(client, "Rezero", client.rezero):
+                                self.out.put(("info", "Rezero acknowledged by device"))
                 except queue.Empty:
                     pass
                 if stopping:
@@ -217,9 +299,9 @@ class Worker(threading.Thread):
                 now = time.monotonic()
                 if streaming and (now - last_temp_poll) >= TEMP_POLL_INTERVAL:
                     last_temp_poll = now
+                    if not self._stop_stream(client, "Stream Off (temperature poll)"):
+                        continue  # still streaming; try again next interval
                     try:
-                        client.set_timeout(COMMAND_TIMEOUT)
-                        client.stream_off(Channel.TCP_UDP)
                         # Raw ADC counts (level 4) - the calibrated "With
                         # temp." level always reports 0.00 on this unit's
                         # firmware, so show the uncalibrated raw value
@@ -227,11 +309,17 @@ class Worker(threading.Thread):
                         raw_temps = client.get_raw_readings(StatusLevel.RAW_TEMP, read_timeout=COMMAND_TIMEOUT)
                         if raw_temps:
                             self.out.put(("temperature", raw_temps))
-                        client.stream_on(Channel.TCP_UDP)
-                    except Exception as exc:
+                    except (socket.timeout, ValueError, RuntimeError) as exc:
                         self.out.put(("error", f"temperature poll failed: {exc}"))
-                    finally:
-                        client.set_timeout(STREAM_READ_TIMEOUT)
+                    # The stream is off at this point no matter how the read
+                    # went - always try to bring it back, and if the device
+                    # refuses, say so and flip the state instead of leaving
+                    # the GUI claiming "streaming" over a silent line.
+                    if self._send(client, "Stream On (after temperature poll)", lambda: client.stream_on(Channel.TCP_UDP)):
+                        buf = PacketBuffer(channels)
+                    else:
+                        streaming = False
+                        self.out.put(("stream_state", False))
                     continue  # let the next loop iteration resume pressure reads
 
                 # 3) pressure stream reads
@@ -241,13 +329,16 @@ class Worker(threading.Thread):
                         data = client.read_raw()
                     except socket.timeout:
                         continue
-                    except OSError as exc:
-                        self.out.put(("error", f"connection lost: {exc}"))
+                    if not data:
+                        self.out.put(("error", "connection closed by device"))
                         break
                     buf.feed(data)
                     packet = buf.pop_packet()
                     while packet is not None:
-                        values = [scale_differential(v, full_scale) for v in packet.values]
+                        if scaled:
+                            values = [scale_differential(v, full_scale) for v in packet.values]
+                        else:
+                            values = [float(v) for v in packet.values]
                         # Raw counts ride along so the log stays lossless -
                         # scaling is reversible, but keeping the integers
                         # means a log can be re-scaled later if the full
@@ -256,6 +347,11 @@ class Worker(threading.Thread):
                         packet = buf.pop_packet()
                 else:
                     time.sleep(0.1)
+        except OSError as exc:
+            # Anything socket-level that is not a plain timeout (reset,
+            # unplugged cable, ...) ends the session; the GUI gets a message
+            # rather than a dead thread with a traceback on stderr.
+            self.out.put(("error", f"connection lost: {exc}"))
         finally:
             try:
                 client.set_timeout(COMMAND_TIMEOUT)
@@ -275,6 +371,8 @@ class MonitorApp:
         self.out_queue: "queue.Queue[tuple]" = queue.Queue()
         self.channel_rows: list[dict[str, tk.Widget]] = []
         self.units = ""
+        self.unit_label = ""  # column header / CSV suffix for the pressure value
+        self.to_pa: float | None = None  # None = no Pa / airspeed conversion available
         self.channel_count = 0
         self.log_fh = None
         self.log_writer = None
@@ -346,9 +444,14 @@ class MonitorApp:
     def on_stream_toggle(self) -> None:
         if self.worker is None:
             return
-        self.streaming = not self.streaming
-        self.worker.request_stream(self.streaming)
-        self.stream_btn.configure(text="Stream Off" if self.streaming else "Stream On")
+        # Ask the worker and wait for its "stream_state" echo before
+        # changing the button - the device may NACK or time out.
+        self.worker.request_stream(not self.streaming)
+        self.stream_btn.configure(state="disabled")
+
+    def apply_stream_state(self, streaming: bool) -> None:
+        self.streaming = streaming
+        self.stream_btn.configure(text="Stream Off" if streaming else "Stream On", state="normal")
 
     def on_rezero(self) -> None:
         if self.worker is not None:
@@ -385,7 +488,7 @@ class MonitorApp:
         ])
         header = ["iso_time", "elapsed_s", "packet_index"]
         header += [f"ch{i}_raw" for i in range(1, self.channel_count + 1)]
-        header += [f"ch{i}_psig" for i in range(1, self.channel_count + 1)]
+        header += [f"ch{i}_{self.unit_label}" for i in range(1, self.channel_count + 1)]
         header += [f"ch{i}_pa" for i in range(1, self.channel_count + 1)]
         header += [f"ch{i}_kmh" for i in range(1, self.channel_count + 1)]
         writer.writerow(header)
@@ -423,11 +526,15 @@ class MonitorApp:
             f"{now - self.log_started_at:.3f}",
             self.log_packet_index,
         ]
-        pascals = [v * PSI_TO_PA for v in values]
         row += list(raws)
         row += [f"{v:.{PSI_DECIMALS}f}" for v in values]
-        row += [f"{pa:.{PA_DECIMALS}f}" for pa in pascals]
-        row += [f"{airspeed_kmh(pa):.2f}" for pa in pascals]
+        if self.to_pa is not None:
+            pascals = [v * self.to_pa for v in values]
+            row += [f"{pa:.{PA_DECIMALS}f}" for pa in pascals]
+            row += [f"{airspeed_kmh(pa):.2f}" for pa in pascals]
+        else:
+            row += ["" for _ in values]
+            row += ["" for _ in values]
         try:
             self.log_writer.writerow(row)
             self.log_rows_written += 1
@@ -445,11 +552,12 @@ class MonitorApp:
 
     # -- worker -> GUI updates -------------------------------------------
 
-    def build_channel_grid(self, channels: int, units: str) -> None:
+    def build_channel_grid(self, channels: int, units: str, scaled: bool = True) -> None:
         for child in self.grid_frame.winfo_children():
             child.destroy()
         self.channel_rows = []
-        self.units = units
+        self.units = units if scaled else "raw"
+        units = self.units
         self.channel_count = channels
 
         # "psig" rather than "psid": the scanner only has Absolute/Differential
@@ -458,6 +566,7 @@ class MonitorApp:
         # which is how this rig is plumbed. If you ever pipe the reference
         # port to something other than ambient, this label is a lie.
         gauge_label = f"{units}g" if units == "psi" else units
+        self.unit_label = gauge_label
         ttk.Label(self.grid_frame, text="CH", width=4, font=("", 10, "bold")).grid(row=0, column=0)
         ttk.Label(self.grid_frame, text=f"Pressure ({gauge_label})", width=14, font=("", 10, "bold")).grid(row=0, column=1)
         ttk.Label(self.grid_frame, text="Pressure (Pa)", width=14, font=("", 10, "bold")).grid(row=0, column=2)
@@ -483,29 +592,34 @@ class MonitorApp:
             })
 
     def poll_queue(self) -> None:
+        # Every packet is logged, but only the newest one per tick is drawn:
+        # at 100 Hz there are ~10 packets per 100 ms tick and 48 widget
+        # updates each, and redrawing all of them would let a backlog
+        # monopolise the Tk main thread. The eye cannot tell the difference.
+        latest_pressure = None
         try:
             while True:
                 kind, payload = self.out_queue.get_nowait()
                 if kind == "config":
-                    self.build_channel_grid(payload["channels"], payload["units"])
+                    self.to_pa = payload["to_pa"]
+                    self.build_channel_grid(payload["channels"], payload["units"], payload["scaled"])
                     self.status_var.set(
                         f"Connected ({payload['channels']} ch, "
                         f"FS={payload['full_scale']} {payload['units']}, {payload['press_type']})"
                     )
                     self.connect_btn.configure(text="Disconnect", state="normal")
-                    self.stream_btn.configure(state="normal", text="Stream Off")
                     self.rezero_btn.configure(state="normal")
                     self.log_btn.configure(state="normal")
-                    self.streaming = True
+                    self.apply_stream_state(True)
+                elif kind == "stream_state":
+                    self.apply_stream_state(bool(payload))
                 elif kind == "pressure":
                     values, raws = payload
                     if self.log_writer is not None:
                         self.write_log_row(values, raws)
-                    for var_row, value in zip(self.channel_rows, values):
-                        pascal = value * PSI_TO_PA
-                        var_row["pressure"].set(f"{value:.{PSI_DECIMALS}f}")
-                        var_row["pascal"].set(f"{pascal:.{PA_DECIMALS}f}")
-                        var_row["speed"].set(f"{airspeed_kmh(pascal):.2f}")
+                    latest_pressure = values
+                elif kind == "info":
+                    self.log_var.set(str(payload))
                 elif kind == "temperature":
                     for var_row, value in zip(self.channel_rows, payload):
                         var_row["temp"].set(f"{value:.0f}")
@@ -521,6 +635,17 @@ class MonitorApp:
                     self.log_btn.configure(state="disabled")
         except queue.Empty:
             pass
+        if latest_pressure is not None and self.channel_rows:
+            decimals = 0 if self.units == "raw" else PSI_DECIMALS
+            for var_row, value in zip(self.channel_rows, latest_pressure):
+                var_row["pressure"].set(f"{value:.{decimals}f}")
+                if self.to_pa is not None:
+                    pascal = value * self.to_pa
+                    var_row["pascal"].set(f"{pascal:.{PA_DECIMALS}f}")
+                    var_row["speed"].set(f"{airspeed_kmh(pascal):.2f}")
+                else:
+                    var_row["pascal"].set("--")
+                    var_row["speed"].set("--")
         self.root.after(100, self.poll_queue)
 
 

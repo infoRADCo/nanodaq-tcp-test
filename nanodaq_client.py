@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import socket
+import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Iterator
@@ -209,21 +210,29 @@ class NanoDAQClient:
             data += chunk
         return data
 
-    def flush_input(self, timeout: float = 0.3) -> bytes:
+    def flush_input(self, timeout: float = 0.3, max_duration: float = 2.0) -> int:
         """Discard any bytes already buffered/in-flight (e.g. leftover from
         a stream the device was still sending when we connected). Should be
         called right after connect(), before sending the first command.
+
+        Returns the number of bytes discarded. Stops when the socket has been
+        quiet for `timeout` seconds OR after `max_duration` seconds in total,
+        whichever comes first. The hard cap matters: a device that is still
+        streaming (100 Hz = a packet every 10 ms) never goes quiet, so
+        waiting for silence alone would spin forever and hoard every byte.
+        Callers that need a quiet line should send Standby and flush again.
         """
         sock = self._require_socket()
         old_timeout = sock.gettimeout()
         sock.settimeout(timeout)
-        discarded = b""
+        discarded = 0
+        deadline = time.monotonic() + max_duration
         try:
-            while True:
+            while time.monotonic() < deadline:
                 chunk = sock.recv(4096)
                 if not chunk:
                     break
-                discarded += chunk
+                discarded += len(chunk)
         except socket.timeout:
             pass
         finally:
@@ -248,6 +257,35 @@ class NanoDAQClient:
 
     def stream_off(self, channel: Channel = Channel.TCP_UDP) -> bool | None:
         return self.send_command(Command.STREAM_OFF, int(channel))
+
+    def stream_off_quiesce(self, channel: Channel = Channel.TCP_UDP,
+                           quiet: float = 0.3, max_duration: float = 2.0) -> bool:
+        """Stop a RUNNING stream and wait for the line to go quiet.
+
+        While the device is streaming, its `**` ack to Stream Off arrives
+        interleaved with the packets still in flight, so reading a bare
+        2-byte ack (as stream_off() does) picks up stream bytes instead and
+        fails even though the device did stop. Use this variant whenever
+        the stream is (or may be) on: it sends the command without reading
+        an ack and drains everything until nothing has arrived for `quiet`
+        seconds. Returns True if the device went quiet (stream stopped),
+        False if data kept coming for `max_duration` seconds.
+        """
+        sock = self._require_socket()
+        sock.sendall(build_command(Command.STREAM_OFF, int(channel)))
+        old_timeout = sock.gettimeout()
+        sock.settimeout(quiet)
+        deadline = time.monotonic() + max_duration
+        try:
+            while time.monotonic() < deadline:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("socket closed while stopping stream")
+        except socket.timeout:
+            return True
+        finally:
+            sock.settimeout(old_timeout)
+        return False
 
     def set_protocol(self, protocol: Protocol, channel: Channel = Channel.TCP_UDP) -> bool | None:
         # parameter byte = 0xab, a = channel (1=TCP/UDP, 2=CAN), b = protocol
