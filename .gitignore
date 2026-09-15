@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 .venv/
 
+# PoC local snapshots
+reports/
+
 # 모니터 GUI 가 남기는 CSV 로그 (측정 데이터 — 코드가 아님)
 logs/
 
