@@ -19,6 +19,8 @@ cd nanodaq-tcp-test
 
 - 의존성: PySide6, pyqtgraph, numpy, scipy (레포의 `.venv`에 설치되어 있음)
 - 자가 점검(오프스크린): `.venv\Scripts\python.exe -m workbench --selftest`
+- 세션 로깅(임시): `--log` 를 붙이면 `logs/{세션}.csv`(전 샘플)와 `logs/{세션}_events.csv`(이벤트)를
+  남긴다. 아래 "세션 로그" 절 참고.
 
 ### 실장비(nanoDAQ) 연결
 
@@ -42,6 +44,21 @@ cd nanodaq-tcp-test
   (CH7에 +800 Pa 얹은 에뮬레이터) → `-m workbench --ip 127.0.0.1 --port 10101`
 - 화면 캡처 생성: `.venv\Scripts\python.exe scripts\capture_screens.py`
   → `docs/poc_screens/*.png` 5장
+
+## 세션 로그 (`--log`)
+
+실장비 검증(이슈 #1의 10분 연속 수신·랜선 재접속·Zero All 등)의 증거를 파일로 남기기 위한
+임시 기능. 화면은 바뀌지 않고 푸터 세션명 뒤에 `· LOG` 가 붙는다.
+
+| 파일 | 내용 |
+|---|---|
+| `logs/{세션}.csv` | 패킷마다 한 줄. `iso_time, elapsed_s, packet_index, ch1..16_raw, ch1..16_pa`. 첫 줄은 `# workbench log …` 메타(세션·모드·장비·레이트). `monitor_gui.py` 의 CSV 와 같은 골격 |
+| `logs/{세션}_events.csv` | `iso_time, elapsed_s, kind, note`. kind = `source_connecting / source_streaming / source_error`(접속 상태 전이), `zero_request / zero_done / zero_failed`, `marker`, `snapshot`, `session_end` |
+
+- raw 는 장비 ADC 카운트(16 bit). 시뮬레이터는 raw 가 없어 빈칸. pa 는 링 버퍼 값과 동일.
+- 데시메이션 없음(100 Hz ≈ 70 MB/h). flush 는 1 s 간격.
+- 읽기: `pandas.read_csv(path, comment="#")`. 전달률은 `elapsed_s` 차분, 끊김은 `source_error` 이벤트와
+  `elapsed_s` 의 큰 간격으로 확인한다.
 
 ## 무엇이 목업이고 무엇이 실제인가
 
@@ -77,7 +94,8 @@ cd nanodaq-tcp-test
 workbench/
 ├── __main__.py     # 진입점 + --selftest
 ├── theme.py        # 다크 팔레트 + 앱 스타일시트
-├── ring.py         # 스레드 안전 링 버퍼 (16ch × ~5분 @ 50 Hz)
+├── ring.py         # 스레드 안전 링 버퍼 (16ch × 10분 @ 100 Hz)
+├── logger.py       # SessionLogger: --log 세션 CSV (샘플 + 이벤트)
 ├── sim.py          # SimSource: 50 Hz 시나리오 생성 스레드
 ├── nanodaq_source.py # NanoDAQSource: 실장비 TCP 스트림 → 링 버퍼 (SimSource 와 동일 인터페이스)
 ├── profiles.py     # 3개 데모 모드 채널 프로파일 (이름·기하)
