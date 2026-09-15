@@ -55,7 +55,7 @@ IP/Port 입력 후 **Connect**를 누르면 자동으로:
 1. 접속 → 잔여 스트림 데이터 flush → Standby
 2. `Get Status(Full)`로 채널 수 / Full Scale / 압력 타입 자동 인식
 3. Protocol(16bit LE) + Rate(100Hz) 설정 → Stream On
-4. 압력값 실시간 표시, 온도는 5초 간격으로 raw 카운트 표시(섭씨 변환 아님 - 이유는 아래 참고)
+4. 압력값 실시간 표시, 온도는 60초 간격으로 raw 카운트 표시(섭씨 변환 아님 - 이유는 아래 참고)
 
 상단 `Stream On/Off`, `Rezero` 버튼으로 수동 제어도 가능합니다.
 
@@ -76,6 +76,7 @@ IP/Port 입력 후 **Connect**를 누르면 자동으로:
 - Rate 명령의 채널 선택 값이 매뉴얼(4=TCP/UDP, 8=CAN)과 실제 장비(1=TCP/UDP, 2=CAN)가 다름
 - Get Status는 다른 명령과 달리 별도의 `**` ack 없이 바로 상태 프레임으로 응답함
 - Data Rate가 "Off"로 설정된 상태에서는 Stream On을 보내도 데이터가 전혀 나가지 않음
+- 스트리밍 중에 보낸 명령(Stream Off, Rezero)의 `**` ack는 진행 중인 스트림 패킷 사이에 섞여 들어오므로 2바이트 ack로 읽을 수 없음. 모니터는 Stream Off를 "회선이 조용해질 때까지" 로 판정하고, Rezero는 스트림을 잠시 멈춘 뒤 보냄
 - 저속(1~5Hz)에서는 TCP 버퍼링으로 인해 데이터가 몇 초 단위로 뭉쳐서 도착함 (정상 동작)
 - 이 유닛은 `Get Status`의 보정된 온도(With temp./Full)가 항상 `0.00`을 반환함 — 원인 불명의
   펌웨어 결함으로 보이며, 대신 raw 값(level 4)을 그대로 사용
