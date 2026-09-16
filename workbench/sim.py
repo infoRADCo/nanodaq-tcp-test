@@ -22,6 +22,8 @@ class SimSource(threading.Thread):
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._rng = np.random.default_rng(20260823)
+        # 선택적 훅: on_packet(t, raw, pa). 시뮬레이터는 raw 가 없어 None 을 준다.
+        self.on_packet = None
 
         self._mode = "downwash"
         self._drone = False
@@ -85,7 +87,10 @@ class SimSource(threading.Thread):
                 vals = self._gen_edf(ts, shield)
             else:
                 vals = self._gen_aerobench(ts, rpm)
-            self.ring.append(time.time(), vals + off)
+            now = time.time()
+            self.ring.append(now, vals + off)
+            if self.on_packet is not None:
+                self.on_packet(now, None, vals + off)
 
             next_t += period
             dt = next_t - time.perf_counter()

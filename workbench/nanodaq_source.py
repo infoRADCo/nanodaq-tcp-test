@@ -69,6 +69,12 @@ class NanoDAQSource(threading.Thread):
         self._stop_evt = threading.Event()
         self._rezero_req = threading.Event()
 
+        # 선택적 훅 (start() 전에 설정). 둘 다 소스 스레드에서 불린다.
+        #   on_packet(t, raw16, pa16) — 패킷마다. raw 는 장비 ADC 카운트.
+        #   on_event(state, message)  — 접속 상태 전이(connecting/streaming/error)마다.
+        self.on_packet = None
+        self.on_event = None
+
         # UI 가 읽는 상태 (스레드 안전 getter 로만 접근)
         self._state = "connecting"     # connecting | streaming | error
         self._message = f"{ip}:{port} 접속 중"
@@ -150,6 +156,8 @@ class NanoDAQSource(threading.Thread):
         with self._lock:
             self._state = state
             self._message = message
+        if self.on_event is not None:
+            self.on_event(state, message)
 
     # ------------------------------------------------ 메인 루프
     def run(self):
@@ -262,6 +270,8 @@ class NanoDAQSource(threading.Thread):
                     vals[i] = scale_differential(raw, full_scale) * to_pa
                 t = max(now - (len(packets) - 1 - k) * period, last_t + 1e-4)
                 self.ring.append(t, vals)
+                if self.on_packet is not None:
+                    self.on_packet(t, packet.values[:16], vals)
                 last_t = t
             self._last_sample_t = last_t
             with self._lock:

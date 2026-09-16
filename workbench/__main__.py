@@ -1,9 +1,11 @@
-"""진입점: python -m workbench [--ip ADDR [--port N] [--rate HZ]] [--selftest]
+"""진입점: python -m workbench [--ip ADDR [--port N] [--rate HZ]] [--log] [--selftest]
 
 --ip       : nanoDAQ 장비 IP. 지정하면 시뮬레이터 대신 실장비 스트림을 표시한다.
 --port     : TCP 포트 (기본 101)
 --rate     : 장비 데이터 레이트 Hz (기본 100; 1/5/10/20/25/50/100/150/200)
              이 유닛은 150/200 을 거부한다 — 실측 상한 100 Hz
+--log      : 세션의 모든 샘플과 이벤트를 logs/{session}.csv, logs/{session}_events.csv
+             에 남긴다 (임시 로깅 — 실장비 검증 증거용. 포맷은 workbench/logger.py 참고).
 --selftest : 오프스크린 자가 점검 — Setup → Zero All → 3개 Live 모드(각 2 s)
              → Replay → 스냅샷 내보내기 후 종료 코드 0.
 """
@@ -63,6 +65,7 @@ def main():
     # 이 유닛은 오버샘플링 설정 때문에 150/200 Hz 를 거부한다 (실측: NACK).
     # 100 Hz 가 실질 상한이므로 기본값으로 둔다.
     ap.add_argument("--rate", type=int, default=100, help="장비 데이터 레이트 Hz")
+    ap.add_argument("--log", action="store_true", help="샘플·이벤트를 logs/ 에 CSV 로 기록")
     ap.add_argument("--selftest", action="store_true")
     args, qt_argv = ap.parse_known_args()
     selftest = args.selftest
@@ -89,7 +92,7 @@ def main():
         ring = RingBuffer(RING_CAPACITY, 16)
         source = NanoDAQSource(ring, args.ip, args.port, args.rate)
 
-    win = MainWindow(source=source)
+    win = MainWindow(source=source, log=args.log)
     win.show()
     if selftest:
         run_selftest(app, win)
