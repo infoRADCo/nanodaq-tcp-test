@@ -4,6 +4,7 @@
 시뮬레이터 스레드에서 UI로 직접 시그널을 보내지 않는다.
 """
 
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -70,14 +71,22 @@ class MainWindow(QMainWindow):
 
         # 로거는 소스 start() 전에 훅을 걸어야 첫 패킷부터 남는다.
         self.logger = None
+        self._log_start_error = ""
         if log:
             meta = {"mode": "nanodaq" if self.is_hw else "sim", "rate_hz": f"{self.rate_hz:g}"}
             if self.is_hw:
                 meta["device"] = f"{self.sim.ip}:{self.sim.port}"
-            self.logger = SessionLogger(ROOT / "logs", self.session_name, meta)
-            self.sim.on_packet = self.logger.on_packet
-            if hasattr(self.sim, "on_event"):
-                self.sim.on_event = lambda state, msg: self.logger.event(f"source_{state}", msg)
+            try:
+                self.logger = SessionLogger(ROOT / "logs", self.session_name, meta)
+            except OSError as exc:
+                # UI(토스트)가 아직 없다. 콘솔에 남기고 첫 틱에서 토스트로 알린 뒤 로그 없이 계속한다.
+                self._log_start_error = f"로그 시작 실패, 로그 없이 진행: {exc}"
+                print(f"[log] {self._log_start_error}", file=sys.stderr)
+            else:
+                self.session_name = self.logger.session  # 이름이 겹쳐 접미사가 붙었으면 푸터도 그 이름
+                self.sim.on_packet = self.logger.on_packet
+                if hasattr(self.sim, "on_event"):
+                    self.sim.on_event = lambda state, msg: self.logger.event(f"source_{state}", msg)
         self.sim.start()
 
         self._replay_t = np.empty(0)
@@ -430,7 +439,11 @@ class MainWindow(QMainWindow):
         out = ROOT / "reports"
         out.mkdir(exist_ok=True)
         path = out / f"snapshot_{datetime.now():%Y%m%d_%H%M%S}.png"
-        self.grab().save(str(path))
+        if not self.grab().save(str(path)):
+            # 저장 실패를 성공으로 기록하면 증거 CSV 가 없는 PNG 를 가리킨다.
+            self._log_event("snapshot_failed", path.name)
+            self._show_toast(f"스냅샷 저장 실패: {path.name}")
+            return ""
         self._log_event("snapshot", path.name)
         self._show_toast(f"스냅샷 저장: {path.name}")
         return str(path)
@@ -579,8 +592,11 @@ class MainWindow(QMainWindow):
     # ---------------- 메인 타이머
     def _tick(self):
         self._tick_n += 1
-        if self._tick_n == 1 and self.logger is not None:
-            self._show_toast(f"로그 기록 중: logs/{self.logger.path.name}")
+        if self._tick_n == 1:
+            if self.logger is not None:
+                self._show_toast(f"로그 기록 중: logs/{self.logger.path.name}")
+            elif self._log_start_error:
+                self._show_toast(self._log_start_error)
         if self._tick_n % 12 == 0:  # ~1 s
             if self.logger is not None and self.logger.error and not self._log_error_shown:
                 self._log_error_shown = True
@@ -695,4 +711,4 @@ class ExportDialog(QDialog):
 
     def _save_png(self):
         path = self.win.export_png()
-        self.path_label.setText(f"저장됨: {path}")
+        self.path_label.setText(f"저장됨: {path}" if path else "저장 실패 — reports/ 폴더 쓰기 권한을 확인")

@@ -32,8 +32,6 @@ class SessionLogger:
     def __init__(self, out_dir: Path, session_name: str, meta: dict):
         out_dir = Path(out_dir)
         out_dir.mkdir(exist_ok=True)
-        self.path = out_dir / f"{session_name}.csv"
-        self.events_path = out_dir / f"{session_name}_events.csv"
         self.t0 = time.time()
         self.rows = 0
         self.events = 0
@@ -44,10 +42,30 @@ class SessionLogger:
         self._elock = threading.Lock()
         self._last_flush = self.t0
 
+        # 세션명은 초 단위라 같은 초에 두 번 시작하면 이름이 겹친다. 'x' 모드로 열어 기존 증거를
+        # 절대 덮어쓰지 않고, 겹치면 _1, _2 … 접미사를 붙인다. 두 파일이 한 쌍으로 같은 이름을 갖도록
+        # 이벤트 파일이 겹치면 방금 만든 샘플 파일을 지우고 다음 이름으로 넘어간다.
         # newline="" 는 csv 모듈이 Windows 에서 빈 줄을 끼우지 않게 하는 필수 옵션.
-        self._fh = open(self.path, "w", newline="", encoding="utf-8")
+        for k in range(1000):
+            name = session_name if k == 0 else f"{session_name}_{k}"
+            self.path = out_dir / f"{name}.csv"
+            self.events_path = out_dir / f"{name}_events.csv"
+            try:
+                self._fh = open(self.path, "x", newline="", encoding="utf-8")
+            except FileExistsError:
+                continue
+            try:
+                self._efh = open(self.events_path, "x", newline="", encoding="utf-8")
+            except FileExistsError:
+                self._fh.close()
+                self.path.unlink(missing_ok=True)
+                continue
+            break
+        else:
+            raise OSError(f"로그 파일 이름을 정하지 못함: {out_dir / session_name}")
+        self.session = name
         self._w = csv.writer(self._fh)
-        meta = {"session": session_name, "start": datetime.fromtimestamp(self.t0).isoformat(timespec="seconds"), **meta}
+        meta = {"session": name, "start": datetime.fromtimestamp(self.t0).isoformat(timespec="seconds"), **meta}
         self._w.writerow(["# workbench log " + " ".join(f"{k}={v}" for k, v in meta.items())])
         header = ["iso_time", "elapsed_s", "packet_index"]
         header += [f"ch{i}_raw" for i in range(1, N_CH + 1)]
@@ -55,7 +73,6 @@ class SessionLogger:
         self._w.writerow(header)
         self._fh.flush()
 
-        self._efh = open(self.events_path, "w", newline="", encoding="utf-8")
         self._ew = csv.writer(self._efh)
         self._ew.writerow(["iso_time", "elapsed_s", "kind", "note"])
         self._efh.flush()
@@ -100,7 +117,10 @@ class SessionLogger:
                 self.error = self.error or f"이벤트 로그 쓰기 실패: {exc}"
 
     def close(self) -> str:
-        """두 파일을 닫고 한 줄 요약을 돌려준다. 두 번 불려도 안전."""
+        """두 파일을 닫고 한 줄 요약을 돌려준다. 두 번 불려도 안전.
+
+        마지막 flush 가 실패하면 파일 끝이 잘린 것이므로 error 에 남기고 요약에도 붙인다.
+        요약의 rows 는 writerow 가 성공한 행 수이지 디스크에 확정된 행 수가 아니다."""
         if self._closed:
             return ""
         self.event("session_end", f"rows={self.rows}")
@@ -110,6 +130,7 @@ class SessionLogger:
                 try:
                     fh.flush()
                     fh.close()
-                except OSError:
-                    pass
-        return f"{self.path.name}: {self.rows} rows, {self.events} events"
+                except (OSError, ValueError) as exc:
+                    self.error = self.error or f"로그 닫기 실패({Path(fh.name).name}): 마지막 구간이 잘렸을 수 있음: {exc}"
+        summary = f"{self.path.name}: {self.rows} rows, {self.events} events"
+        return summary + (f" | ERROR {self.error}" if self.error else "")

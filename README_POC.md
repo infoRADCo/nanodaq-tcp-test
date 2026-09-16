@@ -53,7 +53,7 @@ cd nanodaq-tcp-test
 | 파일 | 내용 |
 |---|---|
 | `logs/{세션}.csv` | 패킷마다 한 줄. `iso_time, elapsed_s, packet_index, ch1..16_raw, ch1..16_pa`. 첫 줄은 `# workbench log …` 메타(세션·모드·장비·레이트). `monitor_gui.py` 의 CSV 와 같은 골격 |
-| `logs/{세션}_events.csv` | `iso_time, elapsed_s, kind, note`. kind = `source_connecting / source_streaming / source_error`(접속 상태 전이), `zero_request / zero_done / zero_failed`, `marker`, `snapshot`, `session_end` |
+| `logs/{세션}_events.csv` | `iso_time, elapsed_s, kind, note`. kind = `source_connecting / source_streaming / source_error`(접속 상태 전이), `zero_request / zero_done / zero_failed`, `marker`, `snapshot / snapshot_failed`, `session_end`. 같은 초에 다시 시작하면 파일명에 `_1`, `_2` … 가 붙고 기존 파일은 덮어쓰지 않는다 |
 
 - raw 는 장비 ADC 카운트(16 bit). 시뮬레이터는 raw 가 없어 빈칸. pa 는 링 버퍼 값과 동일.
 - 데시메이션 없음(100 Hz ≈ 70 MB/h). flush 는 1 s 간격.
