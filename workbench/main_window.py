@@ -4,6 +4,7 @@
 시뮬레이터 스레드에서 UI로 직접 시그널을 보내지 않는다.
 """
 
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QComboBox,
                                QVBoxLayout, QWidget)
 
 from . import profiles, theme
+from .logger import SessionLogger
 from .ring import RingBuffer
 from .sim import SimSource
 from .views.cp_view import CpView
@@ -30,7 +32,7 @@ from .views.wake_view import WakeView
 from .widgets import Pill
 
 ROOT = Path(__file__).resolve().parent.parent
-RING_CAPACITY = 16000  # 50 Hz × ~5.3분
+RING_CAPACITY = 60000  # 100 Hz(실장비 기본) × 10분. 60000×17×8 B ≈ 8 MB
 RATE_HZ_SIM = 50.0
 DRIFT_LIMIT_PA = 5.0
 
@@ -44,9 +46,10 @@ def _panel(layout=None) -> QFrame:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, source=None):
+    def __init__(self, source=None, log: bool = False):
         """source: 링 버퍼에 프레임을 쓰는 스레드 (SimSource 또는 NanoDAQSource).
-        None 이면 시뮬레이터. 두 소스는 같은 인터페이스를 노출한다."""
+        None 이면 시뮬레이터. 두 소스는 같은 인터페이스를 노출한다.
+        log: True 면 세션의 모든 샘플·이벤트를 logs/ 에 CSV 로 남긴다 (SessionLogger)."""
         super().__init__()
         self.setWindowTitle("전시 계측 워크벤치 PoC")
         self.resize(1280, 800)
@@ -59,13 +62,34 @@ class MainWindow(QMainWindow):
             self.sim = source
         self.is_hw = not isinstance(self.sim, SimSource)
         self.rate_hz = float(getattr(self.sim, "rate_hz", RATE_HZ_SIM))
-        self.sim.start()
 
         self.mode = "downwash"
         self.zero_time = None
+        self._zero_seen_t = 0.0  # 마지막으로 반영한 실장비 Zero 결과 시각
+        self._log_error_shown = False
         self.markers = []            # 이벤트 마커 (epoch 초)
         self.session_start = time.time()
-        self.session_name = f"{'nanodaq' if self.is_hw else 'sim'}_{datetime.now():%Y%m%d_%H%M}"
+        self.session_name = f"{'nanodaq' if self.is_hw else 'sim'}_{datetime.now():%Y%m%d_%H%M%S}"
+
+        # 로거는 소스 start() 전에 훅을 걸어야 첫 패킷부터 남는다.
+        self.logger = None
+        self._log_start_error = ""
+        if log:
+            meta = {"mode": "nanodaq" if self.is_hw else "sim", "rate_hz": f"{self.rate_hz:g}"}
+            if self.is_hw:
+                meta["device"] = f"{self.sim.ip}:{self.sim.port}"
+            try:
+                self.logger = SessionLogger(ROOT / "logs", self.session_name, meta)
+            except OSError as exc:
+                # UI(토스트)가 아직 없다. 콘솔에 남기고 첫 틱에서 토스트로 알린 뒤 로그 없이 계속한다.
+                self._log_start_error = f"로그 시작 실패, 로그 없이 진행: {exc}"
+                print(f"[log] {self._log_start_error}", file=sys.stderr)
+            else:
+                self.session_name = self.logger.session  # 이름이 겹쳐 접미사가 붙었으면 푸터도 그 이름
+                self.sim.on_packet = self.logger.on_packet
+                if hasattr(self.sim, "on_event"):
+                    self.sim.on_event = lambda state, msg: self.logger.event(f"source_{state}", msg)
+        self.sim.start()
 
         self._replay_t = np.empty(0)
         self._replay_v = np.empty((0, 16))
@@ -162,7 +186,8 @@ class MainWindow(QMainWindow):
         hint.setProperty("role", "dim")
         self.toast = QLabel("")
         self.toast.setStyleSheet(f"color: {theme.AMBER};")
-        self.sess_label = QLabel(f"{self.session_name} · {self.rate_hz:.0f} Hz")
+        self.sess_label = QLabel(
+            f"{self.session_name} · {self.rate_hz:.0f} Hz" + (" · LOG" if self.logger else ""))
         self.sess_label.setProperty("role", "ident")
         sess = self.sess_label
 
@@ -404,11 +429,21 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.Yes:
                 return
         self.sim.zero_all()
+        self._log_event("zero_request", "hw" if self.is_hw else "sim")
+        if self.is_hw:
+            # 실장비는 비동기 — 결과(done/failed)는 _update_zero_pill 이
+            # NanoDAQSource.status()["zero"] 를 보고 반영한다. 여기서 초록으로
+            # 바꾸면 장비가 거부했거나 끊겼을 때도 '영점 완료' 로 남는다.
+            self.pill_zero.setText("ZERO 요청 중…")
+            self.pill_zero.set_kind("amber")
+            self._show_toast("장비 Rezero 요청 (16ch)")
+            self._update_zero_pill(self.sim.status())
+            return
         self.zero_time = datetime.now()
         self.pill_zero.setText(f"ZERO {self.zero_time:%H:%M}")
         self.pill_zero.set_kind("green")
-        self._show_toast("장비 Rezero 명령 전송 (16ch)" if self.is_hw
-                         else "영점 조정 완료 (16ch)")
+        self._show_toast("영점 조정 완료 (16ch)")
+        self._log_event("zero_done", "sim offsets cleared")
 
     def add_marker(self):
         t = time.time()
@@ -417,6 +452,7 @@ class MainWindow(QMainWindow):
                                pen=pg.mkPen(theme.AMBER, width=1.5))
         self.recorder.addItem(line)
         self._marker_lines.append((t, line))
+        self._log_event("marker", f"#{len(self.markers)}", t=t)
         self._show_toast(f"\U0001F4CD 이벤트 마커 #{len(self.markers)} 저장")
 
     def replay_play(self):
@@ -431,7 +467,12 @@ class MainWindow(QMainWindow):
         out = ROOT / "reports"
         out.mkdir(exist_ok=True)
         path = out / f"snapshot_{datetime.now():%Y%m%d_%H%M%S}.png"
-        self.grab().save(str(path))
+        if not self.grab().save(str(path)):
+            # 저장 실패를 성공으로 기록하면 증거 CSV 가 없는 PNG 를 가리킨다.
+            self._log_event("snapshot_failed", path.name)
+            self._show_toast(f"스냅샷 저장 실패: {path.name}")
+            return ""
+        self._log_event("snapshot", path.name)
         self._show_toast(f"스냅샷 저장: {path.name}")
         return str(path)
 
@@ -440,6 +481,16 @@ class MainWindow(QMainWindow):
         self.play_timer.stop()
         self.sim.stop()
         self.sim.join(timeout=1.0)
+        if self.logger is not None:
+            summary = self.logger.close()
+            if summary:
+                print(f"[log] {summary}")
+            if self.logger.error:
+                print(f"[log] {self.logger.error}")
+
+    def _log_event(self, kind: str, note: str = "", t: float | None = None):
+        if self.logger is not None:
+            self.logger.event(kind, note, t)
 
     def closeEvent(self, ev):
         self.shutdown()
@@ -455,7 +506,8 @@ class MainWindow(QMainWindow):
         # rate_hz 는 리플레이/버퍼 길이 계산에도 쓰이므로 같이 옮긴다.
         # 장비가 거부하면 소스가 이전 레이트를 유지하고 상태줄에 남긴다.
         self.rate_hz = float(hz)
-        self.sess_label.setText(f"{self.session_name} · {self.rate_hz:.0f} Hz")
+        self.sess_label.setText(
+            f"{self.session_name} · {self.rate_hz:.0f} Hz" + (" · LOG" if self.logger else ""))
         self._show_toast(f"데이터 레이트 {hz} Hz 로 변경 요청")
 
     # ================================================= 내부
@@ -582,7 +634,15 @@ class MainWindow(QMainWindow):
     # ---------------- 메인 타이머
     def _tick(self):
         self._tick_n += 1
+        if self._tick_n == 1:
+            if self.logger is not None:
+                self._show_toast(f"로그 기록 중: logs/{self.logger.path.name}")
+            elif self._log_start_error:
+                self._show_toast(self._log_start_error)
         if self._tick_n % 12 == 0:  # ~1 s
+            if self.logger is not None and self.logger.error and not self._log_error_shown:
+                self._log_error_shown = True
+                self._show_toast(self.logger.error)
             el = int(time.time() - self.session_start)
             self.pill_rec.setText(f"● REC {el // 60:02d}:{el % 60:02d}")
             if self.is_hw:
@@ -597,8 +657,25 @@ class MainWindow(QMainWindow):
                 self._update_recorder()
 
     # ---------------- 장비 상태
+    def _update_zero_pill(self, st: dict):
+        """실장비 Zero All 결과를 알약에 반영한다. 같은 결과는 한 번만 처리."""
+        zero = st.get("zero")
+        if zero in (None, "pending") or st.get("zero_t", 0.0) == self._zero_seen_t:
+            return
+        self._zero_seen_t = st["zero_t"]
+        self._log_event(f"zero_{zero}", st.get("zero_msg", ""), t=st["zero_t"])
+        if zero == "done":
+            self.zero_time = datetime.fromtimestamp(st["zero_t"])
+            self.pill_zero.setText(f"ZERO {self.zero_time:%H:%M}")
+            self.pill_zero.set_kind("green")
+        else:
+            self.pill_zero.setText("ZERO 실패")
+            self.pill_zero.set_kind("red")
+        self._show_toast(st.get("zero_msg") or ("장비 Rezero 완료" if zero == "done" else "장비 Rezero 실패"))
+
     def _update_device_pill(self):
         st = self.sim.status()
+        self._update_zero_pill(st)
         state = st["state"]
         if state == "streaming":
             self.pill_sim.setText(f"● nanoDAQ {st['packets']} pkt")
@@ -676,4 +753,4 @@ class ExportDialog(QDialog):
 
     def _save_png(self):
         path = self.win.export_png()
-        self.path_label.setText(f"저장됨: {path}")
+        self.path_label.setText(f"저장됨: {path}" if path else "저장 실패 — reports/ 폴더 쓰기 권한을 확인")

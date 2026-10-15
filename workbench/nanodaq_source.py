@@ -70,6 +70,12 @@ class NanoDAQSource(threading.Thread):
         self._rezero_req = threading.Event()
         self._rate_req = None          # 대기 중인 레이트 (Hz) — _lock 으로 보호
 
+        # 선택적 훅 (start() 전에 설정). 둘 다 소스 스레드에서 불린다.
+        #   on_packet(t, raw16, pa16) — 패킷마다. raw 는 장비 ADC 카운트.
+        #   on_event(state, message)  — 접속 상태 전이(connecting/streaming/error)마다.
+        self.on_packet = None
+        self.on_event = None
+
         # UI 가 읽는 상태 (스레드 안전 getter 로만 접근)
         self._state = "connecting"     # connecting | streaming | error
         self._message = f"{ip}:{port} 접속 중"
@@ -77,6 +83,13 @@ class NanoDAQSource(threading.Thread):
         self._full_scale_pa = None
         self._last_packet_t = 0.0
         self._packets = 0
+        self._last_sample_t = 0.0     # 링 버퍼에 마지막으로 쓴 타임스탬프 (단조 증가 보장용)
+
+        # Zero All 결과. UI 는 요청 즉시 '완료' 로 그리지 않고 이 상태를 본다.
+        #   None | "pending" | "done" | "failed"
+        self._zero_state = None
+        self._zero_t = 0.0            # done/failed 가 확정된 시각
+        self._zero_msg = ""
 
     # ------------------------------------------------ SimSource 호환 인터페이스
     def set_mode(self, key: str):
@@ -128,7 +141,22 @@ class NanoDAQSource(threading.Thread):
         return vs.mean(axis=0)
 
     def zero_all(self):
+        """장비 Rezero 요청. 실제 실행·결과는 스트림 스레드가 status()["zero"] 로 보고한다."""
+        with self._lock:
+            if self._state != "streaming":
+                # 접속 전/끊김 중에는 요청을 쌓아두지 않는다 — 나중에 언제 실행될지
+                # 알 수 없는 영점을 UI 가 '완료' 로 오해하는 것을 막는다.
+                self._zero_state, self._zero_t = "failed", time.time()
+                self._zero_msg = "장비 미접속 — Rezero 를 보내지 않음"
+                return
+            self._zero_state, self._zero_msg = "pending", ""
         self._rezero_req.set()
+
+    def _finish_zero(self, ok: bool, msg: str):
+        with self._lock:
+            self._zero_state = "done" if ok else "failed"
+            self._zero_t = time.time()
+            self._zero_msg = msg
 
     def stop(self):
         self._stop_evt.set()
@@ -145,12 +173,17 @@ class NanoDAQSource(threading.Thread):
                 "info": dict(self._info),
                 "full_scale_pa": self._full_scale_pa,
                 "packets": self._packets,
+                "zero": self._zero_state,
+                "zero_t": self._zero_t,
+                "zero_msg": self._zero_msg,
             }
 
     def _set(self, state: str, message: str):
         with self._lock:
             self._state = state
             self._message = message
+        if self.on_event is not None:
+            self.on_event(state, message)
 
     # ------------------------------------------------ 메인 루프
     def run(self):
@@ -159,6 +192,10 @@ class NanoDAQSource(threading.Thread):
                 self._session()
             except Exception as exc:  # 세션 중 예외는 상태로만 보고, 스레드는 살린다
                 self._set("error", f"{type(exc).__name__}: {exc}")
+            # 세션이 끝났는데 Rezero 요청이 남아 있으면 실패로 확정한다.
+            if self._rezero_req.is_set():
+                self._rezero_req.clear()
+                self._finish_zero(False, "연결이 끊겨 Rezero 미실행")
             if self._stop_evt.is_set():
                 break
             self._stop_evt.wait(RECONNECT_DELAY)
@@ -233,9 +270,16 @@ class NanoDAQSource(threading.Thread):
             with self._lock:
                 new_hz, self._rate_req = self._rate_req, None
             if new_hz is not None and new_hz != self.rate_hz:
-                # rezero 와 같은 이유로 스트림을 멈추고 명령을 보낸다.
+                # rezero 와 같은 이유로 스트림을 멈추고 명령을 보낸다. 스트리밍 중엔
+                # Stream Off ack 가 진행 중인 패킷과 섞이므로(_do_rezero 참고) 여기도
+                # 2바이트 ack 를 바로 읽는 stream_off() 대신 stream_off_quiesce() 로
+                # '회선이 조용해졌는가' 를 성공 기준으로 삼는다.
                 client.set_timeout(COMMAND_TIMEOUT)
-                client.stream_off(Channel.TCP_UDP)
+                if not client.stream_off_quiesce(Channel.TCP_UDP):
+                    self._set("streaming",
+                              f"{self._msg_head} · {self.rate_hz:.0f} Hz{self._msg_tail}"
+                              f" · {new_hz} Hz 변경 실패 (장비가 계속 송신 중)")
+                    continue
                 client.flush_input()
                 ok = client.set_rate(RATE_TABLE[new_hz], Channel.TCP_UDP)
                 client.stream_on(Channel.TCP_UDP)
@@ -253,12 +297,7 @@ class NanoDAQSource(threading.Thread):
 
             if self._rezero_req.is_set():
                 self._rezero_req.clear()
-                # 스트림 바이트와 ack 가 섞이지 않도록 잠시 멈추고 rezero
-                client.set_timeout(COMMAND_TIMEOUT)
-                client.stream_off(Channel.TCP_UDP)
-                client.flush_input()
-                client.rezero()
-                client.stream_on(Channel.TCP_UDP)
+                self._do_rezero(client)
                 buf = PacketBuffer(channels)
 
             client.set_timeout(STREAM_READ_TIMEOUT)
@@ -279,12 +318,55 @@ class NanoDAQSource(threading.Thread):
                 continue
             # 한 번의 recv 에 여러 패킷이 뭉쳐 올 수 있음(저속 TCP 버퍼링) —
             # 타임스탬프를 샘플 주기로 펼쳐 마지막 패킷이 now 가 되게 한다.
+            # 단, 한 버스트가 두 recv 로 쪼개져 연달아 오면 역산한 시각이 직전
+            # 묶음과 겹칠 수 있으므로, 직전 샘플보다 항상 뒤가 되도록 조인다
+            # (리플레이 경과 시간이 뒤로 가지 않게).
             now = time.time()
             period = 1.0 / self.rate_hz
+            last_t = self._last_sample_t
             for k, packet in enumerate(packets):
                 for i, raw in enumerate(packet.values[:16]):
                     vals[i] = scale_differential(raw, full_scale) * to_pa
-                self.ring.append(now - (len(packets) - 1 - k) * period, vals)
+                t = max(now - (len(packets) - 1 - k) * period, last_t + 1e-4)
+                self.ring.append(t, vals)
+                if self.on_packet is not None:
+                    self.on_packet(t, packet.values[:16], vals)
+                last_t = t
+            self._last_sample_t = last_t
             with self._lock:
                 self._packets += len(packets)
                 self._last_packet_t = now
+
+    def _do_rezero(self, client):
+        """스트림 중단 → Rezero → 재개. 결과는 _finish_zero 로 UI 에 알린다.
+
+        스트리밍 중에는 명령 ack(`**`)가 진행 중인 패킷 사이에 섞여 오므로
+        2 바이트 ack 읽기가 실패한다(장비는 실제로 멈췄는데도). 그래서 Stream Off 는
+        stream_off_quiesce 로 '회선이 조용해졌는가' 를 성공 기준으로 삼고, 그 뒤의
+        Rezero·Stream On 은 깨끗한 회선에서 ack 를 확인한다. 소켓 오류는 세션
+        종료로 이어지도록 그대로 올린다(run() 이 failed 로 확정).
+        """
+        client.set_timeout(COMMAND_TIMEOUT)
+        if not client.stream_off_quiesce(Channel.TCP_UDP):
+            self._finish_zero(False, "Stream Off 후에도 장비가 계속 송신 — Rezero 생략")
+            return
+        try:
+            ok = client.rezero()
+        except (socket.timeout, RuntimeError) as exc:
+            ok = False
+            err = f"Rezero ack 없음 ({exc})"
+        else:
+            err = "장비가 Rezero 를 거부 (!!)"
+        try:
+            resumed = client.stream_on(Channel.TCP_UDP)
+        except (socket.timeout, RuntimeError):
+            resumed = False
+        if ok and resumed:
+            self._finish_zero(True, "장비 Rezero 완료 (16ch)")
+        elif ok:
+            self._finish_zero(True, "Rezero 완료 — 스트림 재개 실패, 재접속 대기")
+            raise ConnectionError("Stream On 실패 after rezero")
+        else:
+            self._finish_zero(False, err)
+            if not resumed:
+                raise ConnectionError("Stream On 실패 after rezero")
