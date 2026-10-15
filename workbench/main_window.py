@@ -533,7 +533,7 @@ class MainWindow(QMainWindow):
     def _update_setup(self):
         chans = profiles.PROFILES[self.mode]["channels"]
         offs = self.sim.get_offsets()
-        ts, vs = self.ring.latest(100)
+        ts, vs = self.ring.latest(int(self.rate_hz))
         cur = vs[-1] if len(vs) else np.zeros(16)
         rms = vs.std(axis=0) if len(vs) > 3 else np.zeros(16)
         n_ok = 0
