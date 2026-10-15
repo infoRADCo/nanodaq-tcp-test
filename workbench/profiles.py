@@ -77,34 +77,38 @@ AEROBENCH = {
 }
 
 # ---------------------------------------------------------------- Airfoil taps
-# 익형 표면 정압 탭. 2026-09-10 리그 배선 그대로: 앞전부터 CH1..CH5 가 표면을
-# 따라 늘어서고, CH10 이 한참 뒤에 하나 있다. 나머지 10 채널은 배관하지 않았고
-# spare 로 두어 품질 게이트·평균에서 빠지게 한다.
+# 익형 표면 정압 탭. v0.4 NACA4412(시위 65mm) 정식 배치 — Disc #42(2026-09-15)
+# 채널 배치표 기준: CH1 앞전 · CH2~10 윗면 x/c .03/.06/.10/.15/.20/.30/.40/.50/.62
+# · CH11~15 아랫면 x/c .06/.12/.20/.32/.45. CH16(아랫면 x/c .60)은 구멍이 없어
+# 실제로 뚫려있지 않고(자유 피토 프로브로 임시 전용 중) spare 로 둔다.
 #
-# 탭의 실제 x/c 는 아직 실측하지 않았다. 아래 값은 도면 없이 사진에서 눈대중한
-# **공칭값**이며 계산에 쓰이지 않는다 — 뷰는 탭 순서만 쓴다. 실측하면 여기를
-# 채우고 CpView 의 X 축을 x/c 로 바꾸면 진짜 코드방향 분포가 된다.
-AIRFOIL_TAPS = [0, 1, 2, 3, 4, 9]                      # 0-based 채널 인덱스
-AIRFOIL_TAP_LABELS = ["CH1", "CH2", "CH3", "CH4", "CH5", "CH10"]
-AIRFOIL_X_OVER_C_NOMINAL = [0.02, 0.08, 0.16, 0.26, 0.38, 0.85]   # 공칭 — 실측 아님
+# 표시 순서는 앞전 → 윗면(앞→뒤) → 아랫면(뒤→앞)으로 단면을 한 바퀴 도는 순서다
+# (실제 Cp 그림처럼 한 선으로 쭉 이어지게). x/c 는 설계값(Disc #42)이며, 실제
+# 출력물 실측치는 아니다.
+AIRFOIL_TAPS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 14, 13, 12, 11, 10]  # 0-based 채널 인덱스
+AIRFOIL_TAP_LABELS = ["앞전", "윗.03", "윗.06", "윗.10", "윗.15", "윗.20",
+                      "윗.30", "윗.40", "윗.50", "윗.62",
+                      "아.45", "아.32", "아.20", "아.12", "아.06"]
+AIRFOIL_X_OVER_C_NOMINAL = [0.00, 0.03, 0.06, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.62,
+                            0.45, 0.32, 0.20, 0.12, 0.06]   # 설계값(Disc #42) — 실측 아님
 
 _af_channels = []
 for _i in range(16):
     if _i in AIRFOIL_TAPS:
         _k = AIRFOIL_TAPS.index(_i)
         _af_channels.append({
-            "name": f"표면탭 {_k + 1}",
-            "pos": f"x/c ~{AIRFOIL_X_OVER_C_NOMINAL[_k]:.2f} (공칭)",
+            "name": f"표면탭 {AIRFOIL_TAP_LABELS[_k]}",
+            "pos": f"x/c ~{AIRFOIL_X_OVER_C_NOMINAL[_k]:.2f} (설계값)",
             "spare": False,
         })
     else:
-        _af_channels.append({"name": "미사용", "pos": "—", "spare": True})
+        _af_channels.append({"name": "미사용(CH16, 구멍 없음)", "pos": "—", "spare": True})
 
 AIRFOIL = {
     "key": "airfoil",
     "icon": "\U0001F6E9",          # 🛩
     "title": "익형 표면압력",
-    "subtitle": "받음각별 Cp 분포 · 표면탭 6점 (x/c 는 공칭)",
+    "subtitle": "받음각별 Cp 분포 · 표면탭 15점 (x/c 는 설계값)",
     "tap_index": AIRFOIL_TAPS,
     "tap_labels": AIRFOIL_TAP_LABELS,
     "x_over_c_nominal": AIRFOIL_X_OVER_C_NOMINAL,
