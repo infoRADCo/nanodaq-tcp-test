@@ -16,7 +16,10 @@ from .. import profiles, theme
 from ..widgets import StatTile
 
 GRID = 200
-EXTENT = 300.0  # mm
+# 실제 탭 최대 반경(팁 지점, ≈186mm)에 맞춰 여백을 줄임 — 예전 300mm는 4×4
+# 격자(반폭 225mm) 기준이라, 방사형 레이아웃(이슈 #6)에서는 점들이 가운데에
+# 작게 몰려 보였다. 여백 비율은 유지.
+EXTENT = 210.0  # mm
 LEVELS = (-40.0, 120.0)  # 고정 스케일
 
 # 발산형 컬러맵: 파랑 → 어두움(0 부근) → 노랑 → 빨강
@@ -53,8 +56,9 @@ class HeatmapView(QWidget):
         plot.setLabel("left", "y (mm)")
         plot.setMenuEnabled(False)
         plot.setMouseEnabled(False, False)
-        # 고정 범위 (TextItem으로 인한 오토레인지 폭주 방지)
-        plot.setRange(xRange=(-320, 320), yRange=(-320, 320), padding=0)
+        # 고정 범위 (TextItem으로 인한 오토레인지 폭주 방지), EXTENT에 비례한 여백
+        _margin = EXTENT * 320.0 / 300.0
+        plot.setRange(xRange=(-_margin, _margin), yRange=(-_margin, _margin), padding=0)
 
         self.img = pg.ImageItem()
         # setRect는 이미지 shape이 있어야 올바른 변환을 만든다 → 더미 프레임 선할당
