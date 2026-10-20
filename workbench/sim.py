@@ -127,19 +127,19 @@ class SimSource(threading.Thread):
         return vals
 
     def _gen_edf(self, ts, shield):
-        vals = -150.0 + self._rng.normal(0.0, 3.0, 16)
+        taps = profiles.EDF["tap_index"]           # 8개 실배선 채널
+        tap_vals = -150.0 + self._rng.normal(0.0, 3.0, len(taps))
         if shield:
             # 90° 섹터 내 프로브에 최대 −240 Pa 추가 결손 (코사인 감쇠)
-            th = profiles.EDF["theta_deg"]
+            th = profiles.EDF["theta_deg"]          # (8,) — 단일 링이라 링 가중치 없음
             center = 90.0 + 8.0 * np.sin(2 * np.pi * 0.06 * ts)
             dang = (th - center + 180.0) % 360.0 - 180.0
             fall = np.maximum(np.cos(np.pi * dang / 90.0), 0.0)
             fall[np.abs(dang) > 45.0] = 0.0
-            # 외측 링이 조금 더 깊게 결손
-            ring_w = np.where(profiles.EDF["positions"][:, 0] ** 2
-                              + profiles.EDF["positions"][:, 1] ** 2
-                              > (0.7 ** 2), 1.0, 0.85)
-            vals += -240.0 * (fall ** 1.5) * ring_w
+            tap_vals += -240.0 * (fall ** 1.5)
+        vals = np.zeros(16)
+        vals[taps] = tap_vals
+        vals += self._rng.normal(0.0, 1.2, 16)      # 미배선 채널은 노이즈만
         return vals
 
     def _gen_airfoil(self, ts, alpha):

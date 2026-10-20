@@ -50,31 +50,39 @@ DOWNWASH = {
 
 
 # ---------------------------------------------------------------- EDF annulus
-# 16 프로브 = 8 스포크 × 2 링 (총압 레이크), 반경은 덕트 반경 R 정규화값
-EDF_RINGS = (0.55, 0.85)
-_edf_positions = []
-_edf_theta = []
-_edf_channels = []
-for _k in range(8):
-    _th = 45.0 * _k
-    for _ri, _rr in enumerate(EDF_RINGS):
-        _edf_theta.append(_th)
-        _edf_positions.append((_rr * np.cos(np.radians(_th)),
-                               _rr * np.sin(np.radians(_th))))
-        _edf_channels.append({
-            "name": f"총압 {_th:.0f}° {'내측' if _ri == 0 else '외측'}",
-            "pos": f"r/R {_rr:.2f} · {_th:.0f}°",
-            "spare": False,
-        })
+# 8개 단일 링(45도 간격), 덕트 내경 95mm — 팬 마운트 스트럿(90°/270°)을 피하려고
+# 전체 배치를 22.5도 회전함. 각도는 "맨 위 0°, 시계방향" 기준(infoRADCo/daq
+# 이슈 #34, 2026-10-21 확정). CH9~16은 배관 안 함(spare).
+#
+# 각도 → (x,y) 변환은 나침반식(0°=위, 시계방향)이라 일반 수학 각도(0°=+X,
+# 반시계)와 다름: x = R·sin(θ), y = R·cos(θ).
+EDF_TAPS = [0, 1, 2, 3, 4, 5, 6, 7]                      # 0-based 채널 인덱스 (CH1~8)
+EDF_THETA_DEG = [22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5]
+_EDF_R = 0.95  # 덕트 벽(r/R=1.0) 바로 안쪽 — 탭이 벽면에 붙어있음
+
+_edf_positions = [
+    (_EDF_R * np.sin(np.radians(_th)), _EDF_R * np.cos(np.radians(_th)))
+    for _th in EDF_THETA_DEG
+]
+_edf_tap_channels = [
+    {"name": f"총압 {_th:.1f}°", "pos": f"r/R {_EDF_R:.2f} · {_th:.1f}°", "spare": False}
+    for _th in EDF_THETA_DEG
+]
+_edf_channels = [
+    _edf_tap_channels[EDF_TAPS.index(_i)] if _i in EDF_TAPS
+    else {"name": "미사용", "pos": "—", "spare": True}
+    for _i in range(16)
+]
 
 EDF = {
     "key": "edf",
     "icon": "\U0001F535",           # 🔵
     "title": "EDF 인렛 왜곡",
-    "subtitle": "덕트팬 입구 총압 · 8스포크 × 2링",
-    "positions": np.array(_edf_positions),  # (16, 2) 정규화 좌표
-    "theta_deg": np.array(_edf_theta),      # (16,)
-    "channels": _edf_channels,
+    "subtitle": "덕트팬 입구 총압 · 8점 단일 링(45° 간격, 22.5° 회전)",
+    "tap_index": EDF_TAPS,
+    "positions": np.array(_edf_positions),  # (8, 2) 정규화 좌표
+    "theta_deg": np.array(EDF_THETA_DEG),   # (8,)
+    "channels": _edf_channels,              # (16,) Setup 테이블용 — spare 포함
 }
 
 
