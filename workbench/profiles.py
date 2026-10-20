@@ -6,24 +6,44 @@ RHO = 1.204  # 공기 밀도 kg/m^3 (15 °C 부근)
 
 
 # ---------------------------------------------------------------- Downwash
-# 4×4 그리드, x·y ∈ {−225, −75, 75, 225} mm
-_GRID_COORDS = (-225.0, -75.0, 75.0, 225.0)
-_dw_positions = []
-_dw_channels = []
-for _r, _y in enumerate(reversed(_GRID_COORDS)):        # 위(+y)부터
-    for _c, _x in enumerate(_GRID_COORDS):
-        _dw_positions.append((_x, _y))
-        _dw_channels.append({
-            "name": f"그리드 {chr(65 + _r)}{_c + 1}",
-            "pos": f"({_x:+.0f}, {_y:+.0f}) mm",
-            "spare": False,
-        })
+# 방사형 16홀 — PVC 500×500×5T 플레이트, 2026-10-06 확정 (휠베이스 245mm 기준).
+# 이전의 4×4 격자는 8월 말 PoC 더미값이라 실제 설계와 달랐다 (이슈 #6).
+#
+# ⚠️ 아래 CH1~16 순서는 실제 배선 순서가 아니라 설계 도면 작성 순서를 그대로
+# 따른 제안값이다. 실제 배선 시 이 순서대로 연결하거나, 배선 순서에 맞춰
+# 이 배열을 다시 정렬해야 한다.
+_dw_positions = [
+    (0.0, 0.0),          # CH1  center
+    (42.4, 42.4),        # CH2  inner1
+    (42.4, -42.4),       # CH3  inner2
+    (-42.4, 42.4),       # CH4  inner3
+    (-42.4, -42.4),      # CH5  inner4
+    (86.6, 86.6),        # CH6  motor1
+    (86.6, -86.6),       # CH7  motor2
+    (-86.6, 86.6),       # CH8  motor3
+    (-86.6, -86.6),      # CH9  motor4
+    (131.5, 131.5),      # CH10 tip1
+    (131.5, -131.5),     # CH11 tip2
+    (-131.5, 131.5),     # CH12 tip3
+    (-131.5, -131.5),    # CH13 tip4
+    (0.0, 122.5),        # CH14 btw +Y
+    (0.0, -122.5),       # CH15 btw -Y
+    (-122.5, 0.0),       # CH16 btw -X
+]
+_dw_names = ["중앙", "내측1", "내측2", "내측3", "내측4",
+            "모터1", "모터2", "모터3", "모터4",
+            "팁1", "팁2", "팁3", "팁4",
+            "간섭 +Y", "간섭 -Y", "간섭 -X"]
+_dw_channels = [
+    {"name": _dw_names[_i], "pos": f"({_x:+.1f}, {_y:+.1f}) mm", "spare": False}
+    for _i, (_x, _y) in enumerate(_dw_positions)
+]
 
 DOWNWASH = {
     "key": "downwash",
     "icon": "\U0001F300",           # 🌀
     "title": "Downwash 압력 맵",
-    "subtitle": "드론 하방 유동 · 4×4 그리드",
+    "subtitle": "드론 하방 유동 · 방사형 16홀 (휠베이스 245mm 기준)",
     "positions": np.array(_dw_positions),   # (16, 2) mm
     "channels": _dw_channels,
 }
