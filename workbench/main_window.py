@@ -66,6 +66,7 @@ class MainWindow(QMainWindow):
         self.mode = "downwash"
         self.zero_time = None
         self._zero_seen_t = 0.0  # 마지막으로 반영한 실장비 Zero 결과 시각
+        self._rate_seen_t = 0.0  # 마지막으로 반영한 실장비 레이트 변경 결과 시각
         self._log_error_shown = False
         self.markers = []            # 이벤트 마커 (epoch 초)
         self.session_start = time.time()
@@ -500,15 +501,46 @@ class MainWindow(QMainWindow):
         hz = self.rate_box.currentData()
         if hz is None or not self.is_hw:
             return
+        if float(hz) == self.rate_hz:
+            return
         if not self.sim.set_rate_hz(int(hz)):
+            self._select_confirmed_rate()
             self._show_toast(f"{hz} Hz 는 지원되지 않는 값입니다")
             return
-        # rate_hz 는 리플레이/버퍼 길이 계산에도 쓰이므로 같이 옮긴다.
-        # 장비가 거부하면 소스가 이전 레이트를 유지하고 상태줄에 남긴다.
-        self.rate_hz = float(hz)
+        # 콤보박스는 시그널 전에 선택을 바꾸므로, 장비 ack 전에는 확인된 값으로
+        # 되돌려 둔다. 결과가 날 때까지 중복 요청도 막는다.
+        self._select_confirmed_rate()
+        self.rate_box.setEnabled(False)
+        self._show_toast(f"데이터 레이트 {hz} Hz 로 변경 요청")
+
+    def _select_confirmed_rate(self):
+        index = self.rate_box.findData(int(self.rate_hz))
+        if index < 0:
+            return
+        blocked = self.rate_box.blockSignals(True)
+        self.rate_box.setCurrentIndex(index)
+        self.rate_box.blockSignals(blocked)
+
+    def _update_rate_result(self, st: dict):
+        """소스 스레드가 확정한 레이트 변경 결과를 UI에 한 번만 반영한다."""
+        state = st.get("rate")
+        result_t = st.get("rate_t", 0.0)
+        if state in (None, "pending") or result_t == self._rate_seen_t:
+            return
+        self._rate_seen_t = result_t
+
+        # 실패 결과에도 소스의 실제 레이트를 다시 읽어 UI와 계산 기준을 맞춘다.
+        self.rate_hz = float(st.get("rate_hz", self.rate_hz))
+        self._select_confirmed_rate()
+        self.rate_box.setEnabled(True)
         self.sess_label.setText(
             f"{self.session_name} · {self.rate_hz:.0f} Hz" + (" · LOG" if self.logger else ""))
-        self._show_toast(f"데이터 레이트 {hz} Hz 로 변경 요청")
+        if state == "done":
+            msg = st.get("rate_msg") or f"데이터 레이트 {self.rate_hz:.0f} Hz 적용 완료"
+        else:
+            requested = st.get("rate_requested_hz")
+            msg = st.get("rate_msg") or f"{requested} Hz 변경 실패 — 이전 값 유지"
+        self._show_toast(msg)
 
     # ================================================= 내부
     def _show_toast(self, msg: str):
@@ -675,6 +707,7 @@ class MainWindow(QMainWindow):
 
     def _update_device_pill(self):
         st = self.sim.status()
+        self._update_rate_result(st)
         self._update_zero_pill(st)
         state = st["state"]
         if state == "streaming":
