@@ -122,6 +122,9 @@ class CpView(QWidget):
         p = np.asarray(values, dtype=float)[self.taps]
 
         # q: CH1(앞전, taps[0])을 가상 피토관으로 삼아 최근 1초 이동평균.
+        # 리플레이를 뒤로 돌리거나 반복 재생하면 시간이 거꾸로 가므로 기록을 비운다.
+        if self._q_hist and t < self._q_hist[-1][0]:
+            self._q_hist.clear()
         self._q_hist.append((t, float(p[0])))
         while self._q_hist and self._q_hist[0][0] < t - Q_AVG_WINDOW_S:
             self._q_hist.popleft()
