@@ -171,19 +171,21 @@ def wake_shape(x):
     return g * hub * tip
 
 
-def airfoil_cp(s, s_stag: float):
-    """탭 위치 s(0..1, 앞전→뒤)에서의 Cp — 목업용 형상 함수.
+def airfoil_cp(alpha_deg: float):
+    """받음각 alpha 에서 AIRFOIL_TAPS 순서대로의 Cp — 목업용 형상 함수.
 
-    정체점 s_stag 에서 Cp=1 이고, 뒤로 갈수록 유동이 가속해 흡입으로 떨어졌다가
-    후연을 향해 압력이 회복된다. 실제 익형 해석이 아니라 데모용 곡선이다.
+    CpView 가 앞전 탭(CH1)을 q 기준으로 쓰므로 앞전은 항상 정체점 근처(Cp≈1)로
+    둔다. 받음각은 윗면 흡입·아랫면 양압의 차이(얇은 익형 이론풍
+    √((1-x)/x) 하중)로 나타난다. 실제 익형 해석이 아니라 데모용 곡선이다.
     """
-    s = np.asarray(s, dtype=float)
-    d = s - s_stag
-    # 정체점에서 멀어질수록 흡입이 붙는다 (앞뒤 모두).
-    suction = 2.05 * (1.0 - np.exp(-(d / 0.16) ** 2))
-    # 후연을 향한 압력 회복.
-    recovery = np.clip((s - s_stag - 0.12) / 0.85, 0.0, 1.0) ** 0.8
-    return 1.0 - suction * (1.0 - 0.72 * recovery)
+    x = np.asarray(AIRFOIL_X_OVER_C_NOMINAL, dtype=float)
+    a = np.radians(alpha_deg + 4.0)  # NACA4412 무양력각 ≈ −4°
+    load = a * np.sqrt((1.0 - x) / np.maximum(x, 0.01))  # 앞전 x=0 은 아래에서 덮어씀
+    upper = np.array([lbl.startswith("윗") for lbl in AIRFOIL_TAP_LABELS])
+    cp = np.where(upper, -0.2 - load, -0.2 + load)   # -0.2 = 두께로 인한 기본 흡입
+    cp[0] = np.cos(np.radians(alpha_deg)) ** 2       # 앞전: 받음각이 크면 정체점이 살짝 비켜남
+    # CpView 는 q=CH1 로 다시 나누므로 큰 받음각에서 값이 커진다 — 그래프 범위(-1.6) 안에 들게 여유를 둠
+    return np.clip(cp, -1.45, 1.0)
 
 
 def theory_profile(n: int = 120, q_ref: float = 520.0):

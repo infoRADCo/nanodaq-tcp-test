@@ -145,14 +145,12 @@ class SimSource(threading.Thread):
     def _gen_airfoil(self, ts, alpha):
         """받음각 alpha 에서의 표면탭 압력 (Pa).
 
-        받음각을 올리면 정체점이 탭 열을 따라 뒤로 밀린다 — 실장비 스윕에서
-        최대 양압이 CH1 → CH3 · CH5 로 옮겨간 거동 그대로다.
+        앞전(CH1)은 항상 정체점 근처라 CpView 의 q 기준이 살아 있고, 받음각을
+        올리면 윗면 흡입과 아랫면 양압의 차이가 커진다.
         """
         q = 695.0                     # 실측 스윕의 최대 정체압과 같은 크기
-        s_stag = float(np.clip(0.04 + 0.055 * alpha, 0.0, 0.78))
-        s_tap = np.linspace(0.0, 1.0, len(profiles.AIRFOIL_TAPS))
         breath = 1.0 + 0.02 * np.sin(2 * np.pi * 0.35 * ts)
-        cp = profiles.airfoil_cp(s_tap, s_stag)
+        cp = profiles.airfoil_cp(alpha)
         vals = np.zeros(16)
         vals[profiles.AIRFOIL_TAPS] = q * cp * breath
         vals += self._rng.normal(0.0, 1.2, 16)
