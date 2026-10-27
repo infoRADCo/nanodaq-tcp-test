@@ -29,6 +29,7 @@ class SimSource(threading.Thread):
         self._drone = False
         self._shield = False
         self._rpm = 4000
+        self._alpha = 4
 
         # 품질 게이트 스토리용 초기 영점 오프셋: CH3 +12 Pa, CH7 −9 Pa (1-based)
         off = np.zeros(16)
@@ -58,6 +59,14 @@ class SimSource(threading.Thread):
         with self._lock:
             return self._rpm
 
+    def set_alpha(self, deg: int):
+        with self._lock:
+            self._alpha = int(deg)
+
+    def get_alpha(self) -> int:
+        with self._lock:
+            return self._alpha
+
     def get_offsets(self) -> np.ndarray:
         with self._lock:
             return self._offsets.copy()
@@ -79,12 +88,15 @@ class SimSource(threading.Thread):
                 drone = self._drone
                 shield = self._shield
                 rpm = self._rpm
+                alpha = self._alpha
                 off = self._offsets
             ts = time.time() - self._t0
             if mode == "downwash":
                 vals = self._gen_downwash(ts, drone)
             elif mode == "edf":
                 vals = self._gen_edf(ts, shield)
+            elif mode == "airfoil":
+                vals = self._gen_airfoil(ts, alpha)
             else:
                 vals = self._gen_aerobench(ts, rpm)
             now = time.time()
@@ -115,19 +127,33 @@ class SimSource(threading.Thread):
         return vals
 
     def _gen_edf(self, ts, shield):
-        vals = -150.0 + self._rng.normal(0.0, 3.0, 16)
+        taps = profiles.EDF["tap_index"]           # 8개 실배선 채널
+        tap_vals = -150.0 + self._rng.normal(0.0, 3.0, len(taps))
         if shield:
             # 90° 섹터 내 프로브에 최대 −240 Pa 추가 결손 (코사인 감쇠)
-            th = profiles.EDF["theta_deg"]
+            th = profiles.EDF["theta_deg"]          # (8,) — 단일 링이라 링 가중치 없음
             center = 90.0 + 8.0 * np.sin(2 * np.pi * 0.06 * ts)
             dang = (th - center + 180.0) % 360.0 - 180.0
             fall = np.maximum(np.cos(np.pi * dang / 90.0), 0.0)
             fall[np.abs(dang) > 45.0] = 0.0
-            # 외측 링이 조금 더 깊게 결손
-            ring_w = np.where(profiles.EDF["positions"][:, 0] ** 2
-                              + profiles.EDF["positions"][:, 1] ** 2
-                              > (0.7 ** 2), 1.0, 0.85)
-            vals += -240.0 * (fall ** 1.5) * ring_w
+            tap_vals += -240.0 * (fall ** 1.5)
+        vals = np.zeros(16)
+        vals[taps] = tap_vals
+        vals += self._rng.normal(0.0, 1.2, 16)      # 미배선 채널은 노이즈만
+        return vals
+
+    def _gen_airfoil(self, ts, alpha):
+        """받음각 alpha 에서의 표면탭 압력 (Pa).
+
+        앞전(CH1)은 항상 정체점 근처라 CpView 의 q 기준이 살아 있고, 받음각을
+        올리면 윗면 흡입과 아랫면 양압의 차이가 커진다.
+        """
+        q = 695.0                     # 실측 스윕의 최대 정체압과 같은 크기
+        breath = 1.0 + 0.02 * np.sin(2 * np.pi * 0.35 * ts)
+        cp = profiles.airfoil_cp(alpha)
+        vals = np.zeros(16)
+        vals[profiles.AIRFOIL_TAPS] = q * cp * breath
+        vals += self._rng.normal(0.0, 1.2, 16)
         return vals
 
     def _gen_aerobench(self, ts, rpm):

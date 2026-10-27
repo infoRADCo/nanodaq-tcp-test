@@ -16,7 +16,10 @@ from .. import profiles, theme
 from ..widgets import StatTile
 
 GRID = 200
-EXTENT = 300.0  # mm
+# 실제 탭 최대 반경(팁 지점, ≈186mm)에 맞춰 여백을 줄임 — 예전 300mm는 4×4
+# 격자(반폭 225mm) 기준이라, 방사형 레이아웃(이슈 #6)에서는 점들이 가운데에
+# 작게 몰려 보였다. 여백 비율은 유지.
+EXTENT = 210.0  # mm
 LEVELS = (-40.0, 120.0)  # 고정 스케일
 
 # 발산형 컬러맵: 파랑 → 어두움(0 부근) → 노랑 → 빨강
@@ -37,13 +40,19 @@ class HeatmapView(QWidget):
         self._last_log = time.perf_counter()
         self.last_frame_ms = 0.0
 
-        pts = self.profile["positions"]
+        self.pts = pts = self.profile["positions"]
+        self.pts_flip = pts_flip = pts * np.array([-1.0, 1.0])  # 좌우(x) 반전
         gx = np.linspace(-EXTENT, EXTENT, GRID)
         X, Y = np.meshgrid(gx, gx)
         grid_pts = np.column_stack([X.ravel(), Y.ravel()])
-        # 항등행렬을 데이터로 넣어 평가하면 그대로 가중치 행렬 W (40000×16)
-        rbf = RBFInterpolator(pts, np.eye(16), kernel="thin_plate_spline")
-        self.W = rbf(grid_pts)
+        # 항등행렬을 데이터로 넣어 평가하면 그대로 가중치 행렬 W (40000×16).
+        # 부스 배치에 따라 모형이 반대쪽을 보게 될 수 있어, 정방향/반전 두
+        # 행렬을 미리 계산해두고 버튼으로 전환한다 (데이터·채널 매핑은 불변).
+        self.W_normal = RBFInterpolator(
+            pts, np.eye(16), kernel="thin_plate_spline")(grid_pts)
+        self.W_flip = RBFInterpolator(
+            pts_flip, np.eye(16), kernel="thin_plate_spline")(grid_pts)
+        self._flip = False
 
         # ---- 좌: 히트맵
         glw = pg.GraphicsLayoutWidget()
@@ -53,8 +62,9 @@ class HeatmapView(QWidget):
         plot.setLabel("left", "y (mm)")
         plot.setMenuEnabled(False)
         plot.setMouseEnabled(False, False)
-        # 고정 범위 (TextItem으로 인한 오토레인지 폭주 방지)
-        plot.setRange(xRange=(-320, 320), yRange=(-320, 320), padding=0)
+        # 고정 범위 (TextItem으로 인한 오토레인지 폭주 방지), EXTENT에 비례한 여백
+        _margin = EXTENT * 320.0 / 300.0
+        plot.setRange(xRange=(-_margin, _margin), yRange=(-_margin, _margin), padding=0)
 
         self.img = pg.ImageItem()
         # setRect는 이미지 shape이 있어야 올바른 변환을 만든다 → 더미 프레임 선할당
@@ -98,6 +108,13 @@ class HeatmapView(QWidget):
         self.btn_delta.setEnabled(False)
         self.btn_delta.toggled.connect(self._on_delta)
 
+        self.btn_flip = QPushButton("좌우 반전")
+        self.btn_flip.setCheckable(True)
+        self.btn_flip.setToolTip(
+            "부스 배치상 모형이 반대쪽을 볼 때 화면만 좌우로 뒤집습니다.\n"
+            "채널 번호·실측값은 바뀌지 않습니다.")
+        self.btn_flip.toggled.connect(self._on_flip)
+
         right = QVBoxLayout()
         right.setSpacing(8)
         right.addWidget(self.tile_peak)
@@ -107,6 +124,7 @@ class HeatmapView(QWidget):
         right.addWidget(self.btn_drone)
         right.addWidget(self.btn_baseline)
         right.addWidget(self.btn_delta)
+        right.addWidget(self.btn_flip)
         right.addStretch(1)
 
         lay = QHBoxLayout(self)
@@ -134,6 +152,12 @@ class HeatmapView(QWidget):
     def _on_delta(self, on):
         self._delta_on = on
 
+    def _on_flip(self, on):
+        self._flip = on
+        self.btn_flip.setText("좌우 반전됨" if on else "좌우 반전")
+        pts = self.pts_flip if on else self.pts
+        self.dots.setData(x=pts[:, 0], y=pts[:, 1])
+
     # ------------------------------------------------ 프레임 갱신
     def update_frame(self, values: np.ndarray, t: float):
         self._last_values = values
@@ -141,8 +165,9 @@ class HeatmapView(QWidget):
         if self._delta_on and self._baseline is not None:
             v = values - self._baseline
 
+        W = self.W_flip if self._flip else self.W_normal
         t0 = time.perf_counter()
-        img = (self.W @ v).reshape(GRID, GRID)
+        img = (W @ v).reshape(GRID, GRID)
         ms = (time.perf_counter() - t0) * 1e3
         self.last_frame_ms = ms
         self._ms_acc.append(ms)
@@ -157,7 +182,7 @@ class HeatmapView(QWidget):
         self.img.setImage(img, autoLevels=False, levels=LEVELS)
 
         i = int(np.argmax(v))
-        pos = self.profile["positions"][i]
+        pos = (self.pts_flip if self._flip else self.pts)[i]
         self.peak_label.setPos(pos[0], pos[1])
         self.peak_label.setText(f"{v[i]:+.0f} Pa")
         self.tile_peak.set_value(f"{v[i]:+.0f} / CH{i + 1:02d}")

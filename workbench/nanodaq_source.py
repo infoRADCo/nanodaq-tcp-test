@@ -68,6 +68,11 @@ class NanoDAQSource(threading.Thread):
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._rezero_req = threading.Event()
+        self._rate_req = None          # 대기 중인 레이트 (Hz) — _lock 으로 보호
+        self._rate_state = None        # None | "pending" | "done" | "failed"
+        self._rate_t = 0.0             # done/failed 가 확정된 시각
+        self._rate_requested_hz = None
+        self._rate_msg = ""
 
         # 선택적 훅 (start() 전에 설정). 둘 다 소스 스레드에서 불린다.
         #   on_packet(t, raw16, pa16) — 패킷마다. raw 는 장비 ADC 카운트.
@@ -105,6 +110,54 @@ class NanoDAQSource(threading.Thread):
 
     def get_rpm(self) -> int:
         return 0
+
+    def set_alpha(self, deg: int):
+        pass
+
+    def get_alpha(self) -> int:
+        return 0
+
+    # ------------------------------------------------ 데이터 레이트
+    @staticmethod
+    def available_rates():
+        """장비가 받는 레이트 (Hz), 빠른 순."""
+        return sorted(RATE_TABLE, reverse=True)
+
+    def set_rate_hz(self, hz: int) -> bool:
+        """레이트 변경을 요청한다. 실제 적용은 스트림 스레드가 한다.
+
+        소켓은 스트림 스레드만 만지므로(다른 스레드에서 명령을 끼워 넣으면
+        스트림 바이트와 ack 가 섞인다) rezero 와 같은 방식으로 요청만 남긴다.
+        받아들일 수 있는 값이면 True.
+        """
+        if hz not in RATE_TABLE:
+            return False
+        with self._lock:
+            self._rate_state = "pending"
+            self._rate_requested_hz = hz
+            self._rate_msg = ""
+            self._rate_req = hz
+        return True
+
+    def _finish_rate(self, ok: bool, hz: int, msg: str):
+        with self._lock:
+            if ok:
+                self.rate_hz = float(hz)
+                self._rate_code = RATE_TABLE[hz]
+            self._rate_state = "done" if ok else "failed"
+            self._rate_t = time.time()
+            self._rate_requested_hz = hz
+            self._rate_msg = msg
+
+    def _fail_pending_rate(self, msg: str):
+        """세션 종료 시 결과 없이 남은 요청을 실패로 확정한다."""
+        with self._lock:
+            if self._rate_state != "pending":
+                return
+            self._rate_req = None
+            self._rate_state = "failed"
+            self._rate_t = time.time()
+            self._rate_msg = msg
 
     def get_offsets(self) -> np.ndarray:
         """영점 잔류 = 최근 1 s 평균. 실장비는 오프셋을 알 수 없으므로
@@ -150,6 +203,11 @@ class NanoDAQSource(threading.Thread):
                 "zero": self._zero_state,
                 "zero_t": self._zero_t,
                 "zero_msg": self._zero_msg,
+                "rate_hz": self.rate_hz,
+                "rate": self._rate_state,
+                "rate_t": self._rate_t,
+                "rate_requested_hz": self._rate_requested_hz,
+                "rate_msg": self._rate_msg,
             }
 
     def _set(self, state: str, message: str):
@@ -170,6 +228,7 @@ class NanoDAQSource(threading.Thread):
             if self._rezero_req.is_set():
                 self._rezero_req.clear()
                 self._finish_zero(False, "연결이 끊겨 Rezero 미실행")
+            self._fail_pending_rate("연결이 끊겨 레이트 변경 미실행")
             if self._stop_evt.is_set():
                 break
             self._stop_evt.wait(RECONNECT_DELAY)
@@ -217,9 +276,10 @@ class NanoDAQSource(threading.Thread):
             client.set_rate(self._rate_code, Channel.TCP_UDP)
             client.stream_on(Channel.TCP_UDP)
 
-            self._set("streaming",
-                      f"{fields.get('Model', 'nanoDAQ')} · FS {full_scale:g} {units}"
-                      f" = {self._full_scale_pa:.0f} Pa · {self.rate_hz:.0f} Hz{unit_note}")
+            self._msg_head = (f"{fields.get('Model', 'nanoDAQ')} · FS {full_scale:g} {units}"
+                              f" = {self._full_scale_pa:.0f} Pa")
+            self._msg_tail = unit_note
+            self._publish_streaming_msg()
             with self._lock:
                 self._last_packet_t = time.time()
 
@@ -232,10 +292,48 @@ class NanoDAQSource(threading.Thread):
                 pass
             client.close()
 
+    def _publish_streaming_msg(self):
+        self._set("streaming",
+                  f"{self._msg_head} · {self.rate_hz:.0f} Hz{self._msg_tail}")
+
     def _stream_loop(self, client, channels, full_scale, to_pa):
         buf = PacketBuffer(channels)
         vals = np.zeros(16)
         while not self._stop_evt.is_set():
+            with self._lock:
+                new_hz, self._rate_req = self._rate_req, None
+            if new_hz is not None and new_hz == self.rate_hz:
+                self._finish_rate(True, new_hz, f"데이터 레이트 {new_hz} Hz 유지")
+            elif new_hz is not None:
+                # rezero 와 같은 이유로 스트림을 멈추고 명령을 보낸다. 스트리밍 중엔
+                # Stream Off ack 가 진행 중인 패킷과 섞이므로(_do_rezero 참고) 여기도
+                # 2바이트 ack 를 바로 읽는 stream_off() 대신 stream_off_quiesce() 로
+                # '회선이 조용해졌는가' 를 성공 기준으로 삼는다.
+                client.set_timeout(COMMAND_TIMEOUT)
+                if not client.stream_off_quiesce(Channel.TCP_UDP):
+                    msg = f"{new_hz} Hz 변경 실패 (장비가 계속 송신 중)"
+                    self._finish_rate(False, new_hz, msg)
+                    self._set("streaming",
+                              f"{self._msg_head} · {self.rate_hz:.0f} Hz{self._msg_tail}"
+                              f" · {msg}")
+                    continue
+                client.flush_input()
+                ok = client.set_rate(RATE_TABLE[new_hz], Channel.TCP_UDP)
+                client.stream_on(Channel.TCP_UDP)
+                buf = PacketBuffer(channels)
+                if ok is False:
+                    # 장비가 거부 — 오버샘플링 설정이 상한을 낮춰둔 경우가 대표적.
+                    # 이전 레이트가 그대로 살아 있으므로 상태로만 알린다.
+                    msg = f"{new_hz} Hz 거부됨 (오버샘플링 상한 확인)"
+                    self._finish_rate(False, new_hz, msg)
+                    self._set("streaming",
+                              f"{self._msg_head} · {self.rate_hz:.0f} Hz{self._msg_tail}"
+                              f" · {msg}")
+                else:
+                    self._finish_rate(True, new_hz,
+                                      f"데이터 레이트 {new_hz} Hz 적용 완료")
+                    self._publish_streaming_msg()
+
             if self._rezero_req.is_set():
                 self._rezero_req.clear()
                 self._do_rezero(client)

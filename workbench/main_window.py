@@ -13,7 +13,8 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QComboBox,
+                               QDialog,
                                QFrame, QHBoxLayout, QHeaderView, QLabel,
                                QListWidget, QMainWindow, QMessageBox,
                                QPushButton, QSlider, QStackedWidget,
@@ -24,6 +25,7 @@ from . import profiles, theme
 from .logger import SessionLogger
 from .ring import RingBuffer
 from .sim import SimSource
+from .views.cp_view import CpView
 from .views.heatmap_view import HeatmapView
 from .views.polar_view import PolarView
 from .views.wake_view import WakeView
@@ -64,6 +66,7 @@ class MainWindow(QMainWindow):
         self.mode = "downwash"
         self.zero_time = None
         self._zero_seen_t = 0.0  # 마지막으로 반영한 실장비 Zero 결과 시각
+        self._rate_seen_t = 0.0  # 마지막으로 반영한 실장비 레이트 변경 결과 시각
         self._log_error_shown = False
         self.markers = []            # 이벤트 마커 (epoch 초)
         self.session_start = time.time()
@@ -138,6 +141,25 @@ class MainWindow(QMainWindow):
             self.pill_sim.setText("● 접속 중")
         self.pill_zero = Pill("ZERO 필요", "amber")
 
+        rate_label = QLabel("레이트")
+        rate_label.setProperty("role", "dim")
+        self.rate_box = QComboBox()
+        rates = (self.sim.available_rates() if hasattr(self.sim, "available_rates")
+                 else [int(self.rate_hz)])
+        for hz in rates:
+            self.rate_box.addItem(f"{hz} Hz", hz)
+        i = self.rate_box.findData(int(self.rate_hz))
+        if i >= 0:
+            self.rate_box.setCurrentIndex(i)
+        if self.is_hw:
+            self.rate_box.setToolTip(
+                "장비 데이터 레이트. 오버샘플링 설정이 상한을 낮춰둔 경우\n"
+                "높은 값은 장비가 거부할 수 있습니다 (거부 시 이전 값 유지).")
+            self.rate_box.currentIndexChanged.connect(self._on_rate_changed)
+        else:
+            self.rate_box.setEnabled(False)
+            self.rate_box.setToolTip("시뮬레이터는 50 Hz 고정 — 실장비 모드에서만 변경됩니다.")
+
         btn_report = QPushButton("\U0001F4C4 성적서")
         btn_report.clicked.connect(self._open_export_dialog)
 
@@ -149,6 +171,9 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
         lay.addWidget(self.pill_sim)
         lay.addWidget(self.pill_zero)
+        lay.addSpacing(10)
+        lay.addWidget(rate_label)
+        lay.addWidget(self.rate_box)
         lay.addSpacing(10)
         lay.addWidget(btn_report)
         return _panel(lay)
@@ -162,8 +187,10 @@ class MainWindow(QMainWindow):
         hint.setProperty("role", "dim")
         self.toast = QLabel("")
         self.toast.setStyleSheet(f"color: {theme.AMBER};")
-        sess = QLabel(f"{self.session_name} · {self.rate_hz:.0f} Hz" + (" · LOG" if self.logger else ""))
-        sess.setProperty("role", "ident")
+        self.sess_label = QLabel(
+            f"{self.session_name} · {self.rate_hz:.0f} Hz" + (" · LOG" if self.logger else ""))
+        self.sess_label.setProperty("role", "ident")
+        sess = self.sess_label
 
         lay = QHBoxLayout()
         lay.setContentsMargins(12, 6, 12, 6)
@@ -298,6 +325,7 @@ class MainWindow(QMainWindow):
             "downwash": HeatmapView(self.sim),
             "edf": PolarView(self.sim),
             "aerobench": WakeView(self.sim),
+            "airfoil": CpView(self.sim),
         }
         self.live_stack = QStackedWidget()
         for key in profiles.MODE_ORDER:
@@ -333,6 +361,7 @@ class MainWindow(QMainWindow):
             "downwash": HeatmapView(self.sim),
             "edf": PolarView(self.sim),
             "aerobench": WakeView(self.sim),
+            "airfoil": CpView(self.sim),
         }
         self.replay_stack = QStackedWidget()
         for key in profiles.MODE_ORDER:
@@ -468,6 +497,51 @@ class MainWindow(QMainWindow):
         self.shutdown()
         super().closeEvent(ev)
 
+    def _on_rate_changed(self, _index: int):
+        hz = self.rate_box.currentData()
+        if hz is None or not self.is_hw:
+            return
+        if float(hz) == self.rate_hz:
+            return
+        if not self.sim.set_rate_hz(int(hz)):
+            self._select_confirmed_rate()
+            self._show_toast(f"{hz} Hz 는 지원되지 않는 값입니다")
+            return
+        # 콤보박스는 시그널 전에 선택을 바꾸므로, 장비 ack 전에는 확인된 값으로
+        # 되돌려 둔다. 결과가 날 때까지 중복 요청도 막는다.
+        self._select_confirmed_rate()
+        self.rate_box.setEnabled(False)
+        self._show_toast(f"데이터 레이트 {hz} Hz 로 변경 요청")
+
+    def _select_confirmed_rate(self):
+        index = self.rate_box.findData(int(self.rate_hz))
+        if index < 0:
+            return
+        blocked = self.rate_box.blockSignals(True)
+        self.rate_box.setCurrentIndex(index)
+        self.rate_box.blockSignals(blocked)
+
+    def _update_rate_result(self, st: dict):
+        """소스 스레드가 확정한 레이트 변경 결과를 UI에 한 번만 반영한다."""
+        state = st.get("rate")
+        result_t = st.get("rate_t", 0.0)
+        if state in (None, "pending") or result_t == self._rate_seen_t:
+            return
+        self._rate_seen_t = result_t
+
+        # 실패 결과에도 소스의 실제 레이트를 다시 읽어 UI와 계산 기준을 맞춘다.
+        self.rate_hz = float(st.get("rate_hz", self.rate_hz))
+        self._select_confirmed_rate()
+        self.rate_box.setEnabled(True)
+        self.sess_label.setText(
+            f"{self.session_name} · {self.rate_hz:.0f} Hz" + (" · LOG" if self.logger else ""))
+        if state == "done":
+            msg = st.get("rate_msg") or f"데이터 레이트 {self.rate_hz:.0f} Hz 적용 완료"
+        else:
+            requested = st.get("rate_requested_hz")
+            msg = st.get("rate_msg") or f"{requested} Hz 변경 실패 — 이전 값 유지"
+        self._show_toast(msg)
+
     # ================================================= 내부
     def _show_toast(self, msg: str):
         self.toast.setText(msg)
@@ -491,7 +565,7 @@ class MainWindow(QMainWindow):
     def _update_setup(self):
         chans = profiles.PROFILES[self.mode]["channels"]
         offs = self.sim.get_offsets()
-        ts, vs = self.ring.latest(100)
+        ts, vs = self.ring.latest(int(self.rate_hz))
         cur = vs[-1] if len(vs) else np.zeros(16)
         rms = vs.std(axis=0) if len(vs) > 3 else np.zeros(16)
         n_ok = 0
@@ -633,6 +707,7 @@ class MainWindow(QMainWindow):
 
     def _update_device_pill(self):
         st = self.sim.status()
+        self._update_rate_result(st)
         self._update_zero_pill(st)
         state = st["state"]
         if state == "streaming":

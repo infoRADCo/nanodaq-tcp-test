@@ -33,9 +33,10 @@ _BG_RGB = np.array([int(theme.PANEL[1:3], 16), int(theme.PANEL[3:5], 16),
 
 
 def _wedge_path(a0_deg, a1_deg, r0, r1):
+    # 각도는 EDF 탭과 같은 나침반식(0°=위, 시계방향): x = r·sin(θ), y = r·cos(θ)
     th = np.radians(np.linspace(a0_deg, a1_deg, 40))
-    xs = np.concatenate([r1 * np.cos(th), r0 * np.cos(th[::-1])])
-    ys = np.concatenate([r1 * np.sin(th), r0 * np.sin(th[::-1])])
+    xs = np.concatenate([r1 * np.sin(th), r0 * np.sin(th[::-1])])
+    ys = np.concatenate([r1 * np.cos(th), r0 * np.cos(th[::-1])])
     poly = QPolygonF([QPointF(float(x), float(y)) for x, y in zip(xs, ys)])
     path = QPainterPath()
     path.addPolygon(poly)
@@ -48,13 +49,14 @@ class PolarView(QWidget):
         super().__init__(parent)
         self.sim = sim
         self.profile = profiles.EDF
+        self.taps = self.profile["tap_index"]        # 0-based 채널 번호 (8개)
         self._trend = deque(maxlen=800)  # (t, index) 최근 60 s
 
         pts = self.profile["positions"]
         gx = np.linspace(-EXTENT, EXTENT, GRID)
         X, Y = np.meshgrid(gx, gx)
         grid_pts = np.column_stack([X.ravel(), Y.ravel()])
-        rbf = RBFInterpolator(pts, np.eye(16), kernel="thin_plate_spline")
+        rbf = RBFInterpolator(pts, np.eye(len(self.taps)), kernel="thin_plate_spline")
         self.W = rbf(grid_pts)
         R = np.sqrt(X ** 2 + Y ** 2)
         self.mask_out = ((R < R_IN) | (R > R_OUT)).ravel()  # 환형 밖
@@ -94,7 +96,7 @@ class PolarView(QWidget):
         plot.addItem(self.center_label, ignoreBounds=True)
         self._set_center(0.0)
 
-        legend = QLabel("○ 총압 프로브 16 · 면=보간 추정 · 음영=최악 60° 섹터")
+        legend = QLabel("○ 총압 프로브 8 · 면=보간 추정 · 음영=최악 60° 섹터")
         legend.setProperty("role", "dim")
         legend.setAlignment(Qt.AlignCenter)
 
@@ -156,8 +158,10 @@ class PolarView(QWidget):
 
     # ------------------------------------------------ 프레임 갱신
     def update_frame(self, values: np.ndarray, t: float):
+        p = np.asarray(values, dtype=float)[self.taps]   # 8개 실배선 채널만
+
         # RGB 수동 합성 (환형 밖 = 배경색)
-        flat = self.W @ values
+        flat = self.W @ p
         norm = np.clip((flat - LEVELS[0]) / (LEVELS[1] - LEVELS[0]), 0.0, 1.0)
         idx8 = (norm * 255).astype(np.uint8)
         rgb = _LUT[idx8]
@@ -166,14 +170,14 @@ class PolarView(QWidget):
 
         # 왜곡 지수: 60° 섹터 평균 결손 vs 전체 평균
         th = self.profile["theta_deg"]
-        mean_all = values.mean()
+        mean_all = p.mean()
         worst_mean = mean_all
         worst_a0 = 0.0
         for a0 in range(0, 360, 15):
             dang = (th - (a0 + 30.0) + 180.0) % 360.0 - 180.0
             sel = np.abs(dang) <= 30.0
             if sel.any():
-                m = values[sel].mean()
+                m = p[sel].mean()
                 if m < worst_mean:
                     worst_mean = m
                     worst_a0 = a0
@@ -194,4 +198,4 @@ class PolarView(QWidget):
         keep = ts >= t - 60.0
         self.trend_curve.setData(ts[keep] - t, ys[keep])
 
-        self.tile_deficit.set_value(f"{values.min():+.0f}")
+        self.tile_deficit.set_value(f"{p.min():+.0f}")
