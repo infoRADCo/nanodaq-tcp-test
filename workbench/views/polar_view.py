@@ -33,9 +33,10 @@ _BG_RGB = np.array([int(theme.PANEL[1:3], 16), int(theme.PANEL[3:5], 16),
 
 
 def _wedge_path(a0_deg, a1_deg, r0, r1):
+    # 각도는 EDF 탭과 같은 나침반식(0°=위, 시계방향): x = r·sin(θ), y = r·cos(θ)
     th = np.radians(np.linspace(a0_deg, a1_deg, 40))
-    xs = np.concatenate([r1 * np.cos(th), r0 * np.cos(th[::-1])])
-    ys = np.concatenate([r1 * np.sin(th), r0 * np.sin(th[::-1])])
+    xs = np.concatenate([r1 * np.sin(th), r0 * np.sin(th[::-1])])
+    ys = np.concatenate([r1 * np.cos(th), r0 * np.cos(th[::-1])])
     poly = QPolygonF([QPointF(float(x), float(y)) for x, y in zip(xs, ys)])
     path = QPainterPath()
     path.addPolygon(poly)
